@@ -1,0 +1,93 @@
+# 推送 v* 标签时编译四个平台的服务程序，连同 SHA256SUMS 上传到该标签的 Release。
+# 插件第一次使用时按 plugin.json 的版本号下载 v<版本> 的程序，所以标签必须和 plugin.json 的 version 一致。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+      - name: 标签必须是合法版本号，且和 plugin.json 的版本一致
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          # 与插件端 src/binary.js 的 VERSION_RE 一致：插件只会下载格式合法的版本
+          if ! printf '%s' "$tag" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z][0-9A-Za-z.-]*)?$'; then
+            echo "标签 ${GITHUB_REF_NAME} 不是 v<主>.<次>.<修订> 格式的版本号" >&2
+            exit 1
+          fi
+          version="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' .claude-plugin/plugin.json | head -1)"
+          if [ "$tag" != "$version" ]; then
+            echo "标签 ${GITHUB_REF_NAME} 与 plugin.json 的版本 ${version} 不一致" >&2
+            exit 1
+          fi
+      - name: 测试
+        working-directory: server
+        run: go test ./... && go vet ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+      - name: 编译
+        working-directory: server
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p ../dist
+          go build -trimpath -ldflags "-s -w -X main.version=${tag#v}" -o "../dist/cc-doc-review-server-${GOOS}-${GOARCH}" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cc-doc-review-server-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/cc-doc-review-server-${{ matrix.goos }}-${{ matrix.goarch }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 生成 SHA256SUMS
+        working-directory: dist
+        run: |
+          ls -l
+          sha256sum cc-doc-review-server-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: 上传到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+          fi

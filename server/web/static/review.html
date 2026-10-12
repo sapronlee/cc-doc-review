@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文档评审</title>
+  <link rel="stylesheet" href="/static/review.css">
+  <link rel="stylesheet" href="/static/vendor/github.min.css" media="(prefers-color-scheme: light)">
+  <link rel="stylesheet" href="/static/vendor/github-dark.min.css" media="(prefers-color-scheme: dark)">
+  <script src="/static/vendor/marked.min.js"></script>
+  <script src="/static/vendor/purify.min.js"></script>
+  <script src="/static/vendor/highlight.min.js"></script>
+  <script src="/static/vendor/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({ startOnLoad: false, theme: matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default' })
+  </script>
+</head>
+<body>
+  <main id="content" class="markdown-body"></main>
+  <script type="module" src="/static/review.js" data-doc-review="md"></script>
+</body>
+</html>

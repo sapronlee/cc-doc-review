@@ -1,0 +1,7 @@
+bin/
+node_modules/
+.DS_Store
+.claude-plugin/types/
+tests/*.test.js
+dist/
+.superpowers/

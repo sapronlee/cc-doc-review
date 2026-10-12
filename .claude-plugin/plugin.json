@@ -1,0 +1,31 @@
+{
+  "name": "cc-doc-review",
+  "version": "0.2.0",
+  "description": "Review Claude-generated Markdown/HTML in a browser panel: select text, comment, and send the comments back to the Claude Code session.",
+  "author": {
+    "name": "SummErOK"
+  },
+  "homepage": "https://github.com/sapronlee/CC-Doc-Review",
+  "repository": "https://github.com/sapronlee/CC-Doc-Review",
+  "license": "MIT",
+  "userConfig": {
+    "autoRegister": {
+      "type": "boolean",
+      "title": "Auto-register documents for review",
+      "description": "Register a document for review automatically after Claude writes a file that matches the include patterns. When off, open documents manually with /cc-doc-review or by asking Claude to call review_open.",
+      "default": true
+    },
+    "includePatterns": {
+      "type": "string",
+      "title": "Auto-register: include patterns",
+      "description": "Comma-separated glob patterns matched against the path relative to the session working directory (supports **, *, ?, {a,b}; case-insensitive; at most 8 wildcards per pattern). Empty disables auto-registration.",
+      "default": "**/specs/**/*.{md,html},**/plans/**/*.{md,html},**/docs/**/*.{md,markdown,html,htm}"
+    },
+    "excludePatterns": {
+      "type": "string",
+      "title": "Auto-register: exclude patterns",
+      "description": "Comma-separated glob patterns. A match is never auto-registered; exclude wins over include.",
+      "default": "**/.superpowers/**,**/node_modules/**,**/vendor/**,**/dist/**,**/.git/**,**/.claude/**,**/README*,**/CHANGELOG*,**/CLAUDE.md"
+    }
+  }
+}
