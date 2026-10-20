@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A Claude Code plugin for reviewing documents Claude writes. Open a Markdown or HTML file in a browser panel, select text, leave a comment, and send the comments back to the Claude Code session. Claude edits the document, the page refreshes, and each comment is marked resolved with a note on what changed. Everything runs on your machine.
+A Claude Code plugin for replying on documents Claude writes. Open a Markdown or HTML file, select a passage, and write a reply, just like quoting a message in chat. Your replies go to Claude together with your next message. If you have nothing to say about a document, do nothing: there are no statuses, no approvals and no to-do list. Everything runs on your machine.
 
 ## Install
 
@@ -13,34 +13,49 @@ A Claude Code plugin for reviewing documents Claude writes. Open a Markdown or H
 
 The first command adds [SummErOK's plugin marketplace](https://github.com/sapronlee/claude-plugins), named `sapronlee`; you only need it once for all plugins listed there. `cc-doc-review@sapronlee` reads as `plugin@marketplace`.
 
-Then start a new session. You do not need Go: on first use the plugin downloads a prebuilt review server from this repository's GitHub Releases (see [Requirements](#requirements)).
+Then start a new session. You do not need Go: on first use the plugin downloads a prebuilt document server from this repository's GitHub Releases (see [Requirements](#requirements)).
 
 ## Usage
 
-Note: the review page and the plugin's own messages (toasts, status band, review card) are currently in Chinese; the English names below describe the controls.
+The UI language follows Claude Code's `language` setting: Chinese if it contains 中文, Chinese or zh, English otherwise. The names below are the English ones.
 
-- **Open a document.** After Claude writes a document that matches the auto-register patterns, the plugin registers it for review and shows you a toast; it does not notify Claude. The review card in the chat (file name, relative path, counts of drafts / in progress / resolved, with "Open in browser" and "Open in panel" buttons, or a plain link where cards cannot be drawn) appears only when Claude calls `review_open`, so ask Claude to open the document for review. You can also open any file yourself with `/cc-doc-review <file>`.
-- **Check progress.** Say "review progress" (or 「评审进度」, 「看评论」) and Claude calls the `review_status` tool to list this session's documents and their pending comments, as a summary card where possible.
-- **Comment.** Select text, click Comment, and press Enter to save. Collect as many comments as you like, then click Send to Claude at the bottom. In the sidebar you can edit or delete drafts and read the resolution notes on resolved comments.
-- **Claude responds.** Claude edits the document and resolves each comment with a note. The page reloads and comments are re-anchored to the changed text.
-- **Delivery.** When the comments reach the session you see a toast saying N comments were received and Claude is working on them. If sending fails, the plugin retries after 5, 15 and 45 seconds; if that still fails, the comments are attached to your next message instead (they are never pasted into your input box).
-- **Missed replies.** When a turn ends while delivered comments still have no resolution, the plugin reminds Claude once per batch of comments and shows a toast. Subagent turns, interrupted turns, errored turns and comments that were never delivered are not checked.
+1. **Claude writes a document.** If the file matches the auto-register patterns (see [Configuration](#configuration)), the plugin registers it automatically; Claude can also register any file with the `mcp__cc-doc-review__open_doc` tool. Registering is not a review: nothing waits for your answer. Claude puts a link to the document in its reply.
+2. **Open the document.** Click the link in Claude's reply, or type `/cc-doc-review` (no arguments) to list this session's documents in the chat, newest first. Each line has the document name as a link, its folder, the last update time, and "N replies to send" when you have unsent replies on it. Click a link to open the document page in your system browser (the desktop app sends local links there). In the desktop app, when Claude has the built-in browser tool, it also opens the page in the browser pane beside the conversation, so you can reply without switching windows. To register a file yourself, type `/cc-doc-review <file>`: it registers the file and opens it in your browser.
+3. **Select text and reply.** On the document page, select some text. A reply box pops up above the selection (below it when there is no room). Type your reply; press Enter or click the ⊕ icon to add it, Shift+Enter for a new line, Esc or a click outside to cancel. Text inside Mermaid charts, images, canvas and iframe content cannot be replied to.
+4. **See your replies above the prompt box.** Each reply shows on the page as a highlighted passage with a numbered dot; click the dot to see what you wrote, with a delete icon in its top-right corner. A table-style reply list also appears above Claude's prompt box: a rounded frame whose first row reads "↩ N replies" (followed by the document name when there is only one), with **Clear** and **Send** on the right; below it one reply per row, with rules between rows, each showing an orange number dot (matching the page), a gray bar with the dimmed quoted text, and what you wrote, shortened when long. Hover a row to tint it and show × at the end to delete it. The newest 3 replies are listed first, fewer when the window is too short, so the usage band and other modules below are never pushed out; when not all fit, **Show N more** appears on the right of the title row. **Clear** deletes them all and needs two clicks within 3 seconds (the first turns it into **Confirm clear**). Numbers run across the whole session and match the dots on the page.
+5. **Send.** Press Enter in the prompt box (your text goes first, then the replies), or click **Send** in the reply list (this sends just the replies as your message). Slash commands and plugin or notification messages never carry replies. Afterwards the reply list folds away and the marks on the page clear; **Send** also shows a "Sent to Claude" toast.
+6. **Claude answers by number.** In the chat, the sent message is drawn as the same kind of list, with anything you wrote below it. In the desktop app, a message sent with Enter turns into the list only once the app syncs the stored message (usually around when Claude replies); one sent with **Send** shows as the list right away. Claude answers each numbered reply and edits the document as needed. There is no status to update and no reminder.
+7. **See what changed.** When the document file changes, the page refreshes and marks the changed paragraphs with an accent bar and tint. The top bar shows "N changes" with ⌃ ⌄ arrows to jump between them and ✕ to clear the marks. The page scrolls to the first change unless you are writing a reply or scrolled within the last 3 seconds. Only changes made while the page is open are marked.
+
+### What Claude receives
+
+The replies are written into the message body:
+
+```
+[Doc reply] Please answer each by number.
+notes.md (docs/notes.md)
+<!-- reply 1 -->
+> the quoted text from the document
+
+your reply
+
+<!-- reply 2 -->
+> another passage
+
+another reply
+```
+
+The block starts with `[Doc reply] Please answer each by number.` (`[文档回复] 请按编号逐条答复。` when the interface is in Chinese), then one line per document with its name and path (relative when it is under the working directory), then for each reply `<!-- reply N -->`, the quoted text on `> ` lines, a blank line, and what you wrote. In the chat the plugin redraws the message as a reply list; that only changes how it looks, and Claude still gets the text above. If you edit the block by hand and the plugin cannot read it, it shows as plain text.
 
 ### Desktop app and CLI
 
-| | Claude desktop app | Claude Code CLI |
-|---|---|---|
-| Open the review page | review card in the chat, or the status band | review card, or the status band |
-| Status band above the prompt | shown while this session has unresolved comments | shown while this session has unresolved comments |
-| Toasts (delivered, reminded) | shown | shown |
+Both have the reply list above the prompt box and the list in the chat. In both, open documents from the link in Claude's reply or with `/cc-doc-review`.
 
-In the desktop app the status band is a single left-aligned line: Review, then each document laid out flat like the usage line below it: a state icon and the file name as a link. Clicking the name opens its review page in your default browser (the desktop app opens links from plugin UI in the external browser; Claude is not involved). To read it in the browser panel instead, use "Open in panel" on the review card in the chat. Each document is in one review state: **to review** (Claude wrote or changed it and waits for your verdict), **not sent** (you wrote comments but have not sent them), **to confirm** (Claude handled your comments; check the changes), or **with Claude**. The icon before each name shows the state by shape and color: a pink magnifier to review, a yellow pencil for unsent comments, a green check to confirm, and a gray hourglass while Claude works. Your turn comes first; as many documents as fit are shown, the rest fold into "+N". Hovering Review shows a legend with counts; hovering a document shows the full name and "state · folder · last change". Clicking Approve in the top bar of the review page settles the document: it leaves the band and Claude is told it was approved. Documents with no change for 24 hours also leave the band. When another plugin also draws in this space (a usage gauge, say), a thin rule separates the two; with only one of them, there is no rule.
-
-Plugins share the space above the prompt, nested in load order. After drawing its own line, this plugin passes the space on, so a plugin loaded inside it (such as [CC-Gauge](https://github.com/sapronlee/CC-Gauge), a usage gauge) still shows below. A plugin loaded outside it that does not pass the space on hides the status band; load this plugin before that one.
+Several plugins share the space above the prompt box, nested in load order. After drawing its reply list, this plugin puts the inner plugins' content (such as the usage plugin [CC-Gauge](https://github.com/sapronlee/cc-gauge)) below it; with no replies it draws nothing and leaves the space to the others.
 
 ### Dormant mode
 
-The plugin is installed globally but stays dormant in a session until review is actually used, so it adds no review rules to the system prompt (the tool descriptions remain) and does no polling. It keeps the review tools, the slash command and the path check on file writes. It wakes up, and stays awake until the session ends, when Claude calls a review tool, you use `/cc-doc-review`, an auto-register match happens, or this session registered documents earlier (checked when the session starts; if the server is not running, the plugin looks at its local data and starts the server when this session has documents). `/clear` returns it to dormant.
+The plugin is installed globally but stays dormant in a session until documents are actually used, so it adds no rules to the system prompt (the tool description remains) and does no polling. It keeps the `open_doc` tool, the slash command and the path check on file writes. It wakes up, and stays awake until the session ends, when Claude calls `open_doc`, you use `/cc-doc-review`, an auto-register match happens, or this session registered documents earlier (checked when the session starts; if the server is not running, the plugin looks at its local data and starts the server when this session has documents). `/clear` returns it to dormant.
 
 ## Configuration
 
@@ -65,9 +80,9 @@ Set them in either of two ways; changes apply to new sessions:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `autoRegister` | `true` | Register matching documents for review automatically after Claude writes them. When off, use `/cc-doc-review` or ask Claude to call `review_open`. |
-| `includePatterns` | `**/specs/**/*.{md,html},**/plans/**/*.{md,html},**/docs/**/*.{md,markdown,html,htm}` | Comma-separated globs for documents to register. |
-| `excludePatterns` | `**/.superpowers/**,**/node_modules/**,**/vendor/**,**/dist/**,**/.git/**,**/.claude/**,**/README*,**/CHANGELOG*,**/CLAUDE.md` | Comma-separated globs that are never registered. |
+| `autoRegister` | `true` | Register matching documents automatically after Claude writes them, so you can reply on them. When off, use `/cc-doc-review <file>` or ask Claude to call `open_doc`. |
+| `includePatterns` | `**/*.{md,markdown,html,htm}` | Comma-separated globs for documents to register. |
+| `excludePatterns` | `**/.superpowers/**,**/node_modules/**,**/vendor/**,**/dist/**,**/.git/**,**/.claude/**,**/README*,**/CHANGELOG*,**/CLAUDE.md,**/AGENTS.md,**/LICENSE*,**/CONTRIBUTING*,**/SECURITY*,**/CODE_OF_CONDUCT*,**/.github/**,**/build/**,**/coverage/**` | Comma-separated globs that are never registered. |
 
 Pattern syntax:
 
@@ -78,31 +93,40 @@ Pattern syntax:
 - An empty include list matches nothing, so auto-registration does nothing.
 - A pattern with a leading `/` and a directory-style pattern with a trailing `/` (for example `docs/`) match nothing. Use `docs/**` instead.
 - Only files written by Write or Edit in the main conversation are considered. Files outside the working directory and files written by subagents are never auto-registered.
-- Example: to review only the Markdown files under `design/`, set `includePatterns` to `design/**/*.md`.
+- Example: to register only the Markdown files under `design/`, set `includePatterns` to `design/**/*.md`.
 
 Auto-registration failures are reported once, and not retried for a minute.
 
 ## How it works
 
 ```
-Claude writes doc ──> plugin hook ──> local review server (127.0.0.1) ──> review page in browser panel
-        ^                                                                     │ you select text and comment
-        │                                                                     v
-   Claude edits, calls review_resolve <── comments sent into the session as a message
+Claude writes doc ──> plugin hook ──> local doc server (127.0.0.1) ──> doc page in your browser
+                                                                          │ you select text and reply
+                                                                          v
+Claude answers by number <── sent with your next message <── reply list above the prompt
 ```
 
-- `server/`: a small Go server (standard library only) that listens on `127.0.0.1`, ports 4823 to 4830, serves the review page and stores comments in `~/.claude/cc-doc-review/`. The review page is embedded in the binary; Markdown is rendered with marked, sanitized with DOMPurify, and code and diagrams use highlight.js and mermaid (see `THIRD_PARTY_NOTICES.md`).
-- `hooks/` and `src/`: the Claude Code plugin (a hooks module) that starts the server, registers documents, polls for comments, delivers them to the session and checks for missed replies.
-- Tools exposed to Claude: `mcp__cc-doc-review__review_open`, `mcp__cc-doc-review__review_resolve`, `mcp__cc-doc-review__review_status`.
+- `server/`: a small Go server (standard library only) that listens on `127.0.0.1`, ports 4823 to 4830, protected by a token. It serves the document page and stores documents and replies in `~/.claude/cc-doc-review/`. A reply that is not yet sent is a draft, which the UI calls a pending reply. The document page is embedded in the binary and uses server-sent events (SSE) to refresh when the file or the replies change; Markdown is rendered with marked, sanitized with DOMPurify, and code and diagrams use highlight.js and mermaid (see `THIRD_PARTY_NOTICES.md`).
+- `hooks/` and `src/`: the Claude Code plugin (a hooks module) that starts the server, and registers documents. While awake it polls `/api/replies` once a second to keep the reply list up to date. When you send, it writes the replies into your message and marks them as sent on the server.
+- Tool exposed to Claude: `mcp__cc-doc-review__open_doc`.
+
+## Upgrading from 0.2.0
+
+0.3.0 replaces the review workflow with replies on the document:
+
+- Review states and the Approve button are gone, and so are the Send-to-Claude button on the page, the comment sidebar, delivery retries and the reminders. Nothing waits for your verdict any more.
+- Old comments stay in the data directory but are no longer shown.
+- Unsent drafts from 0.2.0 appear as pending replies in the reply list above the prompt box. Send them or delete them.
+- The tool `review_open` is now `open_doc`. If you have permission rules that mention `review_open`, rename them to `open_doc`. The two other tools were removed, so drop any rules for them.
 
 ## Security
 
 - The server listens on `127.0.0.1` only and accepts only requests whose `Host` is `127.0.0.1:<port>` or `localhost:<port>`.
-- Review page links carry an access token (query parameter `t`), generated each time the server starts.
-- When you review an **HTML** document, the review script is injected into that page, so the page's own scripts can read the token and call the review API. Only review HTML you trust.
+- Document page links carry an access token (query parameter `t`), generated each time the server starts.
+- When you open an **HTML** document, the reply script is injected into that page, so the page's own scripts can read the token and call the server API. Only open HTML you trust.
 - `/static/` (the built-in front-end files) and `/api/health` (name and version only) do not check the token.
 - `/asset` does not check the token either. It serves resources from the HTML document's directory and its subdirectories, and never files or directories whose names start with a dot (`.env`, `.git`, and so on). A document ID is derived from the file path (the first 16 hex characters of the SHA-1 of the absolute path), so another process on the same machine can request `/asset` for a registered HTML document.
-- Your review content is not uploaded anywhere. Remote images or scripts referenced by a reviewed page are still fetched by your browser, and the first use of each new version downloads the server binary once from GitHub Releases.
+- Your documents and replies are not uploaded anywhere. Remote images or scripts referenced by a document page are still fetched by your browser, and the first use of each new version downloads the server binary once from GitHub Releases.
 
 ## Requirements
 
@@ -130,4 +154,4 @@ The earlier plugin was named `doc-review` and stored data in `~/.claude/doc-revi
 
 ## License
 
-[MIT](LICENSE). Third-party libraries bundled with the review page are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[MIT](LICENSE). Third-party libraries bundled with the document page are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

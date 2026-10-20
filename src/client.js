@@ -1,4 +1,4 @@
-// 评审服务客户端里不碰 $ 的部分。引擎不允许把 $ 传进 import 来的函数，
+// 文档服务客户端里不碰 $ 的部分。引擎不允许把 $ 传进 import 来的函数，
 // 所以真正调 $ 的 ensureServer / call 写在 hooks/register.js 里。
 
 /** @typedef {{ port: number, token: string, pid: number }} ServerInfo */
@@ -9,11 +9,17 @@ export function dataDirOf(home) {
 }
 
 /**
- * 文档的评审页链接，拼法与服务端 /api/open 返回的一致。
- * @param {{ port: number, token: string }} info @param {string} docId
+ * 文档页链接，拼法与服务端 /api/open 返回的一致，再带上界面文字用哪套（lang）。
+ * @param {{ port: number, token: string }} info @param {string} docId @param {string} [lang]
  */
-export function reviewUrl(info, docId) {
-  return `http://127.0.0.1:${info.port}/review?doc=${encodeURIComponent(docId)}&t=${encodeURIComponent(info.token)}`
+export function reviewUrl(info, docId, lang) {
+  const base = `http://127.0.0.1:${info.port}/review?doc=${encodeURIComponent(docId)}&t=${encodeURIComponent(info.token)}`
+  return lang ? `${base}&lang=${encodeURIComponent(lang)}` : base
+}
+
+/** 给服务端返回的文档页链接加上 lang。@param {string} url @param {string} lang */
+export function withLang(url, lang) {
+  return /[?&]lang=/.test(url) ? url : `${url}${url.includes('?') ? '&' : '?'}lang=${encodeURIComponent(lang)}`
 }
 
 /** 解析 server.json；内容不对就当没有。@param {string} text @returns {ServerInfo | undefined} */
@@ -26,7 +32,7 @@ export function parseInfo(text) {
   }
 }
 
-/** 健康检查的应答是不是评审服务。@param {{ ok: boolean, text: string }} r */
+/** 健康检查的应答是不是本插件的服务。@param {{ ok: boolean, text: string }} r */
 export function isHealthy(r) {
   try {
     return r.ok && JSON.parse(r.text).name === 'cc-doc-review'

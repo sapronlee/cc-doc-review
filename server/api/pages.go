@@ -33,6 +33,7 @@ func (a *app) review(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	_ = a.cfg.Store.MarkSeen(d.ID)
 	status := http.StatusOK
 	var page []byte
 	if d.Kind == "md" {
@@ -43,9 +44,9 @@ func (a *app) review(w http.ResponseWriter, r *http.Request) {
 	} else if page, err = os.ReadFile(d.Path); err == nil {
 		page = inject(page, d.ID)
 	} else {
-		// HTML 文件不在了：仍然注入评审脚本，评论在评论栏里照样能看；文件恢复后 SSE 会触发刷新。
+		// HTML 文件不在了：仍然注入脚本，文件恢复后 SSE 会触发刷新。
 		status = http.StatusNotFound
-		page = inject(missingPage(d.Path), d.ID)
+		page = inject(missingPage(d.Path, r.URL.Query().Get("lang")), d.ID)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -53,12 +54,18 @@ func (a *app) review(w http.ResponseWriter, r *http.Request) {
 	w.Write(page)
 }
 
-func missingPage(path string) []byte {
-	return []byte(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>文件不存在</title></head>` +
-		`<body><p>文件不存在或无法读取：` + html.EscapeString(path) + `。评论仍然保留，可在下方评论列表查看。</p></body></html>`)
+// missingPage 是 HTML 文件不在时的占位页，lang 为 zh 时用中文，其余用英文。
+func missingPage(path, lang string) []byte {
+	p := html.EscapeString(path)
+	if lang == "zh" {
+		return []byte(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>文件不存在</title></head>` +
+			`<body><p>文件不存在或无法读取：` + p + `。文件恢复后页面会自动刷新。</p></body></html>`)
+	}
+	return []byte(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>File not found</title></head>` +
+		`<body><p>File not found or unreadable: ` + p + `. The page refreshes when the file is back.</p></body></html>`)
 }
 
-// inject 给 HTML 加上 base（让相对路径资源走 /asset）和评审脚本。
+// inject 给 HTML 加上 base（让相对路径资源走 /asset）和文档页脚本。
 func inject(page []byte, docID string) []byte {
 	base := []byte(`<base href="/asset/` + docID + `/">`)
 	script := []byte(`<script type="module" src="/static/review.js" data-doc-review="html"></script>`)
@@ -87,6 +94,8 @@ func (a *app) raw(w http.ResponseWriter, r *http.Request) {
 		fail(w, fmt.Errorf("文件不存在或无法读取：%w", err))
 		return
 	}
+	// md 文档页每次刷新内容都走这里：你正看着的文档，Claude 改了也不算「新」
+	_ = a.cfg.Store.MarkSeen(d.ID)
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Write(b)
@@ -133,7 +142,7 @@ func hasDotSegment(p string) bool {
 	return false
 }
 
-// events 每 Poll 检查一次文件修改时间和评论版本，变化时推送 change 事件。
+// events 每 Poll 检查一次文件修改时间和回复版本，变化时推送 change 事件。
 func (a *app) events(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("doc")
 	d, err := a.cfg.Store.Get(id)

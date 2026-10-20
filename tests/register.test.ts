@@ -2,6 +2,8 @@ import { expect, mock, test } from 'claude-code/testing'
 
 import { autoRegisterConfig, isReviewDoc } from '../src/autoreg.js'
 import { parseReply } from '../src/client.js'
+import { withReplies } from '../src/reply.js'
+import { BROWSER_HINT } from '../src/rules.js'
 
 const INFO = { port: 4823, token: 'tok', pid: 5150 }
 const LEGACY_INFO = { port: 4901, token: 'old', pid: 4242 }
@@ -10,7 +12,7 @@ const HASH = 'a'.repeat(64)
 const ASSET = 'cc-doc-review-server-darwin-arm64'
 const VERSIONED = '/home/x/.claude/cc-doc-review/bin/cc-doc-review-server-0.2.0'
 
-/** 把 mod 用到的引擎能力都答上；o 控制服务状态和 outbox 内容。*/
+/** 把 mod 用到的引擎能力都答上；o 控制服务状态和回复内容。*/
 function stub(on: any, o: any = {}) {
   const clock = mock.clock(on, { now: Date.parse('2026-10-11T00:00:00Z') })
   // 数外部调用（网络、文件、进程、环境、会话信息）：休眠时定时器空转，一次都不该有
@@ -24,26 +26,26 @@ function stub(on: any, o: any = {}) {
   const fetched: { method: string; path: string; body?: any }[] = []
   const submitted: string[] = []
   const prompts: { text: string; origin: any; context?: readonly string[] }[] = []
-  const filled: string[] = []
   const spawned: string[][] = []
   const timeouts: { argv: string[]; timeoutMs?: number }[] = []
   const commands: string[] = []
   const toasts: string[] = []
   const copied: any[] = []
-  const panelOpened: string[] = []
   const tools: Record<string, any> = {}
-  let acks = 0
-  // 状态带和一轮结束检查用：本会话文档概况、各文档详情，测试中途可以改
+  // 唤醒检查和 review_status 用：本会话文档概况、各文档详情，测试中途可以改
   const server: any = {
     docs: o.docs ?? [],
     details: o.details ?? {},
-    outbox: o.outbox ?? [],
+    // 待发送的回复（GET /api/replies 的 groups），测试中途可以改
+    replies: o.replies ?? [],
     session: 'sess-1',
     alive: true,
     version: o.serverVersion,
   }
 
   on('env.get', counted(() => ({ value: '/home/x' })))
+  // Claude Code 的设置：language 默认简体中文，o.language 可改
+  on('config.list', () => ({ value: [{ key: 'language', label: 'Language', kind: 'text', value: o.language ?? '简体中文', provider: { kind: 'engine' }, isLocked: false }] }))
   // o.localDocs：本机 docs 目录里的文档文件（{ name, session }）
   on('fs.list', counted(($: any, e: any) =>
     o.localDocs ? { value: o.localDocs.map((d: any) => ({ name: d.name, kind: 'file', size: 10 })) } : { value: [] },
@@ -136,6 +138,7 @@ function stub(on: any, o: any = {}) {
       return o.alive !== false && server.alive ? reply(200, { name: 'cc-doc-review', ...(server.version ? { version: server.version } : {}) }) : reply(503, {})
     if (url.pathname === '/api/open') {
       if (o.openFails) return reply(500, { error: '磁盘满了' })
+      if (o.openBody !== undefined) return { value: { status: 502, ok: false, headers: {}, text: o.openBody } }
       return body.path.endsWith('.txt')
         ? reply(400, { error: '只支持 .md、.markdown、.html、.htm 文件' })
         : reply(200, {
@@ -151,11 +154,25 @@ function stub(on: any, o: any = {}) {
       const d = server.details[url.searchParams.get('doc') ?? '']
       return d ? reply(200, d) : reply(404, { error: '未找到' })
     }
-    if (url.pathname === '/api/outbox') return reply(200, server.outbox)
-    if (url.pathname === '/api/outbox/ack') {
-      acks += 1
-      if (acks <= (o.failAcks ?? 0)) return reply(500, { error: '暂时不可用' })
-      server.outbox = server.outbox.filter((b: any) => b.batch !== body.batch)
+    if (url.pathname === '/api/replies' && method === 'GET') {
+      if (o.repliesGate) await o.repliesGate
+      if (o.repliesFail) return reply(500, { error: '服务忙' })
+      return reply(200, { groups: server.replies, total: server.replies.reduce((n: number, g: any) => n + g.replies.length, 0) })
+    }
+    if (url.pathname === '/api/replies' && method === 'DELETE') {
+      const n = server.replies.reduce((n: number, g: any) => n + g.replies.length, 0)
+      server.replies = []
+      return reply(200, { deleted: n })
+    }
+    if (url.pathname === '/api/replies/sent') {
+      const ids = new Set(body.ids)
+      server.replies = server.replies.map((g: any) => ({ ...g, replies: g.replies.filter((r: any) => !ids.has(r.id)) })).filter((g: any) => g.replies.length > 0)
+      return reply(200, { sent: ids.size })
+    }
+    if (url.pathname === '/api/comments' && method === 'DELETE') {
+      if (o.deleteFails) return reply(500, { error: '磁盘满了' })
+      const id = url.searchParams.get('id')
+      server.replies = server.replies.map((g: any) => ({ ...g, replies: g.replies.filter((r: any) => r.id !== id) })).filter((g: any) => g.replies.length > 0)
       return reply(200, { ok: true })
     }
     if (url.pathname === '/api/resolve') {
@@ -171,13 +188,13 @@ function stub(on: any, o: any = {}) {
   let ownSubmits = 0
   on('prompt.submit', async ($: any, e: any) => {
     if (e.origin?.kind === 'plugin' && e.origin.name === 'cc-doc-review') {
+      // pluginGate：让插件自己发的消息停在半路（Claude 忙时排队）
+      if (o.pluginGate) await o.pluginGate
       submitted.push(e.text)
       ownSubmits += 1
       const isDropped = typeof o.dropSubmit === 'number' ? ownSubmits <= o.dropSubmit : o.dropSubmit === true
       return isDropped ? { drop: '会话不接受' } : { text: e.text }
     }
-    // 让用户消息停在半路（空闲时 next 要等那一轮开始才返回）
-    if (o.userGate) await o.userGate
     if (o.refuseUserPrompts > 0) {
       o.refuseUserPrompts -= 1
       return { drop: '拒绝' }
@@ -185,66 +202,23 @@ function stub(on: any, o: any = {}) {
     prompts.push({ text: e.text, origin: e.origin, context: e.context })
     return { text: e.text, context: e.context }
   })
-  on('prompt.fill', ($: any, e: any) => {
-    filled.push(e.text)
-    return { isFilled: true, text: e.text, cursor: e.text.length }
-  })
   on('ui.copy', ($: any, e: any) => {
     copied.push(e)
     return { value: o.copy ?? { isCopied: true } }
   })
   on('turn.start', ($: any, e: any) => ({ turnId: e.turnId }))
   on('turn.complete', ($: any, e: any) => ({ text: e.answer }))
-  // 会话里的工具：o.browserTool 为真时有桌面版浏览器面板工具
-  on('tool.list', () => ({
-    value: o.browserTool
-      ? [
-          { name: 'mcp__Claude_Browser__preview_start', description: '浏览器面板', mcp: true },
-          { name: 'mcp__Claude_Browser__tabs_context', description: '面板状态', mcp: true },
-        ]
-      : [],
-  }))
-  // 写文件工具和浏览器面板工具：引擎的应答
-  on('tool.call', ($: any, e: any) => {
-    if (e.tool === 'mcp__Claude_Browser__preview_start') {
-      panelOpened.push(e.url)
-      if (o.panelDenied) return { deny: 'The server-side auto mode classifier gave no verdict' }
-      return o.panelFails ? { isError: true, result: undefined, text: '面板打不开' } : { result: 'opened' }
-    }
-    // 面板状态：o.panelHidden 为真时，打开后面板仍没显示
-    if (e.tool === 'mcp__Claude_Browser__tabs_context')
-      // 结果里的引号是转义过的，和真实桌面版一致
-      return { result: o.panelHidden ? '{\\"browserOpen\\": false, \\"tabs\\": []}' : '{\\"browserOpen\\": true} The Browser pane is currently displayed.' }
-    return o.writeErrors ? { isError: true, result: undefined, text: '写入失败' } : { result: `wrote ${e.file_path}` }
-  })
-  // 状态带让位时画引擎自己的
+  // 写文件工具的应答
+  on('tool.call', ($: any, e: any) => (o.writeErrors ? { isError: true, result: undefined, text: '写入失败' } : { result: `wrote ${e.file_path}` }))
+  // 回复区让位时画引擎自己的；o.innerThrows 让下层出错
   on('ui.render', () => {
     if (o.innerThrows) throw new Error('用量带坏了')
-    // engineEmpty：下层只有引擎自己的空内容（没有别的插件画东西）
-    if (o.engineEmpty) return { type: 'Box', props: {}, children: [] }
     return { type: 'Text', props: {}, children: ['engine'] }
   })
-  return { clock, fetched, submitted, prompts, filled, spawned, timeouts, commands, toasts, copied, panelOpened, server, tools, ext }
+  return { clock, fetched, submitted, prompts, spawned, timeouts, commands, toasts, copied, server, tools, ext }
 }
 
-const BAND = {
-  plugin: 'cc-doc-review',
-  component: 'AbovePrompt',
-  surface: 'desktop',
-  viewport: { columns: 120, rows: 40 },
-  props: {
-    hasSurvey: false,
-    isWorking: false,
-    maxRows: 10,
-    bodyColumns: 115,
-    scroll: { offset: 0, bodyRows: 10 },
-    view: {},
-  },
-} as const
-
 const URL_D1 = 'http://127.0.0.1:4823/review?doc=d1&t=tok'
-/** 状态带里点文件得到的链接：直接用文档 ID 拼，不经过 /api/open 重新登记。*/
-const urlOf = (id: string) => `http://127.0.0.1:4823/review?doc=${id}&t=tok`
 
 function allText(node: any): string {
   if (node == null) return ''
@@ -259,46 +233,21 @@ const summary = (id: string, o: any = {}) => ({
   open: (o.drafts ?? 0) + (o.sent ?? 0),
   drafts: o.drafts ?? 0,
   sent: o.sent ?? 0,
-  ...(o.activeAt ? { activeAt: o.activeAt } : {}),
-  ...(o.resolved !== undefined ? { resolved: o.resolved } : {}),
-  ...(o.openedAt ? { openedAt: o.openedAt } : {}),
-  ...(o.state ? { state: o.state, changedAt: o.changedAt ?? '2026-10-10T23:50:00Z' } : {}),
 })
 
-/** 状态带每 2 秒取一次文档概况。*/
-async function refresh(clock: any) {
-  await clock.advance(2000)
-  await clock.settle()
-}
-
-async function band($: any, props: any = {}) {
-  return $.ui.mount({ ...BAND, props: { ...BAND.props, ...props } })
-}
-
-/** 命令行版状态带：文件有〔打开〕按钮，打开流程（面板、系统浏览器、请 Claude）用它测。*/
-async function terminalBand($: any) {
-  return $.ui.mount({ ...BAND, surface: 'terminal' })
-}
-
-/** 一轮结束；核对在后台跑，settle 一下让它跑完。*/
+/** 一轮结束；settle 一下让后台的事跑完。*/
 async function turnDone($: any, clock: any, extra: any = {}) {
   await $.turn.complete({ answer: '好了', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer', ...extra })
   await clock.settle()
-}
-
-/** 投递一批评论，并让那条「[文档评审]」消息开始一轮（引擎在真正发出时会这样做）。*/
-async function deliverAndStart($: any, s: any) {
-  await tick(s.clock)
-  await $.turn.start({ text: s.submitted.at(-1), turnId: 't1' })
 }
 
 async function boot($: any) {
   await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/proj' })
 }
 
-/** 唤醒：调用一次评审工具。投递、状态带、一轮结束检查都只在唤醒后运行。*/
+/** 唤醒：调用一次评审工具。取回复和回复区都只在唤醒后运行。*/
 async function wake($: any, s: any) {
-  await $.tool.call({ tool: 'mcp__cc-doc-review__review_open', path: 'docs/plan.md' })
+  await $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'docs/plan.md' })
   await s.clock.settle()
 }
 
@@ -318,17 +267,10 @@ async function tick(clock: any) {
   await clock.settle()
 }
 
-const BATCH = {
-  batch: 'b_20261011_100500_ab12',
-  doc: 'd1',
-  path: '/proj/docs/plan.md',
-  comments: [{ id: 'c_1', quote: '方案', body: '改成表格' }],
-}
-
-test('review_open 把相对路径补成绝对路径并登记到当前会话', async ($, on) => {
+test('open_doc 把相对路径补成绝对路径并登记到当前会话', async ($, on) => {
   const s = stub(on)
   await boot($)
-  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__review_open', path: 'docs/plan.md' })
+  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'docs/plan.md' })
   expect(String(ran.result)).toContain('http://127.0.0.1:4823/review?doc=d1&t=tok')
   expect(s.fetched.find(f => f.path === '/api/open')?.body).toEqual({ path: '/proj/docs/plan.md', session: 'sess-1' })
 })
@@ -336,88 +278,49 @@ test('review_open 把相对路径补成绝对路径并登记到当前会话', as
 test('插件以别的名字加载（会话中途改名、热重载后沿用旧名）时，按引擎给的真实工具名响应', async ($, on) => {
   const s = stub(on, { pluginName: 'doc-review' })
   await boot($)
-  const ran: any = await $.tool.call({ tool: 'mcp__doc-review__review_open', path: 'docs/plan.md' })
+  const ran: any = await $.tool.call({ tool: 'mcp__doc-review__open_doc', path: 'docs/plan.md' })
   expect(String(ran.result)).toContain('http://127.0.0.1:4823/review?doc=d1&t=tok')
   const status: any = await $.tool.call({ tool: 'mcp__doc-review__review_status' })
   expect(String(status.result)).not.toContain('失败')
   // 写死的默认名不是这个会话里的工具，原样交给引擎
-  const other: any = await $.tool.call({ tool: 'mcp__cc-doc-review__review_open', path: 'docs/plan.md' })
+  const other: any = await $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'docs/plan.md' })
   expect(String(other.result)).toBe('wrote undefined')
   expect(s.fetched.filter(f => f.path === '/api/open').length).toBe(1)
 })
 
-test('review_open 的返回带评审卡片的数据和画法说明', async ($, on) => {
-  stub(on, { openComments: [{ id: 'c_1', status: 'draft' }, { id: 'c_2', status: 'sent' }, { id: 'c_3', status: 'resolved' }] })
-  await boot($)
-  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__review_open', path: 'docs/plan.md' })
-  const text = String(ran.result)
-  const data = JSON.parse(text.match(/卡片数据：(.*)/)?.[1] ?? 'null')
-  expect(data).toEqual({ url: URL_D1, name: 'plan.md', path: 'docs/plan.md', drafts: 1, sent: 1, resolved: 1 })
-  expect(text).toContain('show_widget')
-  expect(text).toContain('直接把链接')
-})
-
-test('review_status 注册为工具，返回各文档路径、链接、条数和待处理评论，并唤醒', async ($, on) => {
-  const s = stub(on, {
-    docs: [],
-    details: {
-      plan: {
-        id: 'plan',
-        path: '/proj/docs/plan.md',
-        comments: [
-          { id: 'c_1', status: 'sent', quote: '方案', body: '改成表格' },
-          { id: 'c_2', status: 'draft', quote: '草稿', body: '还没发' },
-          { id: 'c_3', status: 'resolved', quote: 'x', body: 'y' },
-        ],
-      },
-    },
-  })
-  await boot($)
-  await s.clock.settle()
-  expect(await isAwake(s)).toBe(false)
-  s.server.docs = [summary('plan', { sent: 1, drafts: 1 }), summary('gone')]
-  expect(s.tools.review_status?.description).toContain('评审进度')
-  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__review_status' })
-  const text = String(ran.result)
-  expect(text).toContain('plan.md（docs/plan.md）')
-  expect(text).toContain('http://127.0.0.1:4823/review?doc=plan&t=tok')
-  expect(text).toContain('待发送 1 条 · 处理中 1 条 · 已解决 1 条')
-  expect(text).toContain('[c_1] 原文：「方案」')
-  expect(text).toContain('意见：改成表格')
-  // 草稿用户还没发，不给 Claude
-  expect(text).not.toContain('还没发')
-  // 取不到详情的文档照样列出，用概况里的条数
-  expect(text).toContain('gone.md（docs/gone.md）')
-  expect(await isAwake(s)).toBe(true)
-})
-
-test('review_status 本会话没有文档时直说', async ($, on) => {
-  stub(on, { docs: [] })
-  await boot($)
-  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__review_status' })
-  expect(String(ran.result)).toContain('还没有登记')
-})
-
-test('review_open 失败时把服务端原因告诉模型', async ($, on) => {
+test('open_doc 只返回路径和带 lang 的链接，不再要求画卡片', async ($, on) => {
   stub(on)
   await boot($)
-  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__review_open', path: 'a.txt' })
-  expect(String(ran.deny)).toContain('只支持')
+  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'docs/plan.md' })
+  const text = String(ran.result)
+  expect(text).toBe(
+    [`Registered: docs/plan.md`, `Link: ${URL_D1}&lang=zh`, `For your reply: [打开 plan](${URL_D1}&lang=zh)`, BROWSER_HINT].join('\n'),
+  )
+  expect(text).not.toContain('show_widget')
 })
 
-test('review_resolve 透传条目并报告数量', async ($, on) => {
+test('旧工具名 review_open、review_resolve、review_status 不再注册，也不被插件接住', async ($, on) => {
   const s = stub(on)
   await boot($)
-  const items = [{ id: 'c_1', note: '已改' }, { id: 'c_2', note: '没改：超出范围' }]
-  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__review_resolve', items })
-  expect(String(ran.result)).toContain('2 条')
-  expect(s.fetched.find(f => f.path === '/api/resolve')?.body).toEqual({ items })
+  expect(Object.keys(s.tools)).toEqual(['open_doc'])
+  for (const tool of ['mcp__cc-doc-review__review_open', 'mcp__cc-doc-review__review_resolve', 'mcp__cc-doc-review__review_status']) {
+    const ran: any = await $.tool.call({ tool, path: 'docs/plan.md' })
+    expect(String(ran.result)).toBe('wrote undefined')
+  }
+  expect(s.fetched.some(f => f.path === '/api/open')).toBe(false)
+})
+
+test('open_doc 失败时把服务端原因告诉模型', async ($, on) => {
+  stub(on)
+  await boot($)
+  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'a.txt' })
+  expect(String(ran.deny)).toContain('只支持')
 })
 
 test('服务没在跑就在后台启动它', async ($, on) => {
   const s = stub(on, { alive: false })
   await boot($)
-  const pending = $.tool.call({ tool: 'mcp__cc-doc-review__review_open', path: 'docs/plan.md' })
+  const pending = $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'docs/plan.md' })
   await s.clock.advance(4000)
   await pending
   const run = s.spawned.find(a => a[0] === '/bin/sh')
@@ -429,7 +332,7 @@ test('服务没在跑就在后台启动它', async ($, on) => {
 
 /** 启动服务（服务不在，mod 会先迁移再启动），返回按顺序执行过的命令。*/
 async function startServer($: any, s: any) {
-  const pending = $.tool.call({ tool: 'mcp__cc-doc-review__review_open', path: 'docs/plan.md' })
+  const pending = $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'docs/plan.md' })
   await s.clock.advance(4000)
   await pending
   return s.spawned as string[][]
@@ -486,7 +389,7 @@ test('端口上的 health 名字不是 doc-review 时不结束进程', async ($,
   expect(ran.some(a => a[0] === 'kill')).toBe(false)
 })
 
-test('进程命令行不是旧版评审服务时不结束进程', async ($, on) => {
+test('进程命令行不是旧版文档服务时不结束进程', async ($, on) => {
   const s = stub(on, { alive: false, legacyDir: true, legacyName: 'doc-review', legacyCommand: '/usr/bin/node app.js' })
   await boot($)
   const ran = await startServer($, s)
@@ -511,26 +414,10 @@ test('复制失败时提示并继续启动服务', async ($, on) => {
   expect(ran.some(isStart)).toBe(true)
 })
 
-test('review_resolve 部分 ID 找不到时报告成功条数和找不到的 ID', async ($, on) => {
-  stub(on)
-  await boot($)
-  const items = [{ id: 'c_1', note: '已改' }, { id: 'c_gone1', note: 'x' }]
-  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__review_resolve', items })
-  expect(String(ran.result)).toContain('已标记 1 条')
-  expect(String(ran.result)).toContain('c_gone1')
-})
-
-test('review_resolve 全部找不到时把原因告诉模型', async ($, on) => {
-  stub(on)
-  await boot($)
-  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__review_resolve', items: [{ id: 'c_gone1', note: 'x' }] })
-  expect(String(ran.deny)).toContain('c_gone1')
-})
-
 test('服务应答不是 JSON 时报 HTTP 状态码', async ($, on) => {
-  stub(on, { resolveBody: '<html>Bad Gateway</html>' })
+  stub(on, { openBody: '<html>Bad Gateway</html>' })
   await boot($)
-  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__review_resolve', items: [{ id: 'c_1', note: 'x' }] })
+  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'docs/plan.md' })
   expect(String(ran.deny)).toContain('HTTP 502')
 })
 
@@ -540,20 +427,20 @@ test('parseReply：非 JSON 的错误应答给出状态码', async () => {
   expect(parseReply({ ok: true, status: 200, text: '' })).toEqual({})
 })
 
-test('会话重复开始时投递定时器不叠加', async ($, on) => {
+test('会话重复开始时取回复的定时器不叠加', async ($, on) => {
   const s = stub(on, { docs: [summary('plan')] })
   await boot($)
   await boot($)
   await s.clock.settle()
   await tick(s.clock)
-  expect(s.fetched.filter(f => f.path.startsWith('/api/outbox?')).length).toBe(1)
+  expect(s.fetched.filter(f => f.path.startsWith('/api/replies?')).length).toBe(1)
 })
 
 // ---- 预编译分发：首次使用下载、校验、本地编译兜底、开发模式、版本自更新 ----
 
 /** 调一次 review_open（服务可能要启动，推进时钟让等待结束），返回工具结果。*/
 async function openOnce($: any, s: any) {
-  const pending = $.tool.call({ tool: 'mcp__cc-doc-review__review_open', path: 'docs/plan.md' })
+  const pending = $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'docs/plan.md' })
   await s.clock.advance(4000)
   return (await pending) as any
 }
@@ -589,10 +476,10 @@ test('首次使用：下载程序和 SHA256SUMS，校验通过后保存到数据
   await boot($)
   const ran = await openOnce($, s)
   expect(String(ran.result)).toContain('review?doc=d1')
-  expect(s.toasts.some((t: string) => t.includes('首次使用，正在下载评审服务'))).toBe(true)
+  expect(s.toasts.some((t: string) => t.includes('首次使用，正在下载文档服务'))).toBe(true)
   const curls = argvOf(s, 'curl')
   expect(curls.length).toBe(2)
-  const base = 'https://github.com/sapronlee/CC-Doc-Review/releases/download/v0.2.0'
+  const base = 'https://github.com/sapronlee/cc-doc-review/releases/download/v0.2.0'
   // 临时文件名带本次独有的后缀，下载、校验、改名都只针对这两个文件
   const part = curls[0].at(-2) as string
   const sumsFile = curls[1].at(-2) as string
@@ -621,7 +508,7 @@ test('linux 平台下载对应的程序', async ($, on) => {
   const ran = await openOnce($, s)
   expect(String(ran.result)).toContain('review?doc=d1')
   expect(argvOf(s, 'curl')[0].at(-1)).toBe(
-    'https://github.com/sapronlee/CC-Doc-Review/releases/download/v0.2.0/cc-doc-review-server-linux-arm64',
+    'https://github.com/sapronlee/cc-doc-review/releases/download/v0.2.0/cc-doc-review-server-linux-arm64',
   )
 })
 
@@ -701,7 +588,7 @@ test('下载失败且没有 Go：错误里有平台、原因和建议', async ($
   await boot($)
   const ran = await openOnce($, s)
   const msg = String(ran.deny)
-  expect(msg).toContain('评审服务')
+  expect(msg).toContain('文档服务')
   expect(msg).toContain('darwin/arm64')
   expect(msg).toContain('404')
   expect(msg).toContain('没有 Go')
@@ -751,7 +638,7 @@ test('准备失败后一分钟内不再重试，过后再试', async ($, on) => 
 test('同时来了几个调用只下载一次', async ($, on) => {
   const s = stub(on, { ...FRESH, startsAlive: true })
   await boot($)
-  const calls = [1, 2, 3].map(() => $.tool.call({ tool: 'mcp__cc-doc-review__review_open', path: 'docs/plan.md' }))
+  const calls = [1, 2, 3].map(() => $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'docs/plan.md' }))
   await s.clock.advance(4000)
   await Promise.all(calls)
   expect(argvOf(s, 'curl').length).toBe(2)
@@ -798,7 +685,7 @@ test('旧版服务的 health 没有版本号：当作版本不同，重启', asy
   expect(s.spawned.some(isStart)).toBe(true)
 })
 
-test('进程命令行不是评审服务：不结束，继续用旧版并提示', async ($, on) => {
+test('进程命令行不是文档服务：不结束，继续用旧版并提示', async ($, on) => {
   const s = stub(on, { hasBinary: false, hasVersioned: true, serverVersion: '0.1.0', serverCommand: '/usr/bin/node app.js' })
   await boot($)
   const ran = await openOnce($, s)
@@ -833,7 +720,7 @@ test('服务比插件新（旧会话还加载着旧插件）：不降级，不�
   const ran = await openOnce($, s)
   expect(String(ran.result)).toContain('review?doc=d1')
   expect(s.spawned.length).toBe(0)
-  expect(s.toasts.some((t: string) => t.includes('评审服务要更新'))).toBe(false)
+  expect(s.toasts.some((t: string) => t.includes('文档服务要更新'))).toBe(false)
 })
 
 test('服务版本号不是 semver（如 dev）：不重启', async ($, on) => {
@@ -875,8 +762,8 @@ test('旧进程暂时没能结束：一分钟内不再试，过后可以重试',
 test('两个调用同时发现服务过旧：只结束一次旧进程、只启动一次新进程', async ($, on) => {
   const s = stub(on, { hasBinary: false, serverVersion: '0.1.0', startsAlive: true, slowCurlMs: 500 })
   await boot($)
-  const first = $.tool.call({ tool: 'mcp__cc-doc-review__review_open', path: 'docs/plan.md' })
-  const second = $.tool.call({ tool: 'mcp__cc-doc-review__review_open', path: 'docs/plan.md' })
+  const first = $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'docs/plan.md' })
+  const second = $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'docs/plan.md' })
   await s.clock.advance(4000)
   await Promise.all([first, second])
   expect(s.spawned.filter(isKill).length).toBe(1)
@@ -892,166 +779,15 @@ test('重启后版本仍对不上时不会反复重启', async ($, on) => {
   expect(s.spawned.filter(isStart).length).toBe(1)
 })
 
-test('outbox 里的批次发进会话并确认送达，只发一次', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH] })
-  await bootAwake($, s)
-  await tick(s.clock)
-  await tick(s.clock)
-  expect(s.submitted.length).toBe(1)
-  expect(s.submitted[0]).toContain('[文档评审] docs/plan.md 有 1 条新评论')
-  expect(s.fetched.filter(f => f.path === '/api/outbox/ack').length).toBe(1)
-})
-
-test('送达成功时提示「已收到 N 条评论，Claude 正在处理」', async ($, on) => {
-  const two = { ...BATCH, comments: [...BATCH.comments, { id: 'c_2', quote: 'x', body: 'y' }] }
-  const s = stub(on, { outbox: [two] })
-  await bootAwake($, s)
-  await tick(s.clock)
-  expect(s.toasts).toContain('已收到 2 条评论，Claude 正在处理')
-})
-
 /** 用户在输入框里发一条消息。*/
 async function userSays($: any, text: string, kind = 'composer') {
   return $.prompt.submit({ text, wait: false, origin: { kind } })
 }
 
-/** 走 n 次每秒的投递 tick。*/
+/** 走 n 次每秒的定时器 tick。*/
 async function ticks(clock: any, n: number) {
   for (let i = 0; i < n; i++) await tick(clock)
 }
-
-test('发不进会话时按 5、15、45 秒重试，之后不再发，也不填进输入框', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], dropSubmit: true })
-  await bootAwake($, s)
-  await tick(s.clock)
-  expect(s.submitted.length).toBe(1)
-  await ticks(s.clock, 4)
-  expect(s.submitted.length).toBe(1)
-  await tick(s.clock) // 失败后第 5 秒
-  expect(s.submitted.length).toBe(2)
-  await ticks(s.clock, 14)
-  expect(s.submitted.length).toBe(2)
-  await tick(s.clock) // 再失败后第 15 秒
-  expect(s.submitted.length).toBe(3)
-  await ticks(s.clock, 44)
-  expect(s.submitted.length).toBe(3)
-  await tick(s.clock) // 再失败后第 45 秒
-  expect(s.submitted.length).toBe(4)
-  await s.clock.advance(300_000)
-  await s.clock.settle()
-  expect(s.submitted.length).toBe(4)
-  expect(s.filled).toEqual([])
-  // 没送达就不确认
-  expect(s.fetched.filter(f => f.path === '/api/outbox/ack').length).toBe(0)
-  expect(s.toasts.some((t: string) => t.includes('下一条消息'))).toBe(true)
-})
-
-test('重试成功后确认送达并提示，只发到成功为止', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], dropSubmit: 1 })
-  await bootAwake($, s)
-  await tick(s.clock)
-  expect(s.toasts).not.toContain('已收到 1 条评论，Claude 正在处理')
-  await ticks(s.clock, 5)
-  expect(s.submitted.length).toBe(2)
-  expect(s.fetched.filter(f => f.path === '/api/outbox/ack').length).toBe(1)
-  expect(s.toasts).toContain('已收到 1 条评论，Claude 正在处理')
-  await ticks(s.clock, 60)
-  expect(s.submitted.length).toBe(2)
-})
-
-/** 投递一直失败，走完 3 次重试。*/
-async function exhaustRetries(s: any) {
-  await ticks(s.clock, 1 + 5 + 15 + 45)
-  expect(s.submitted.length).toBe(4)
-}
-
-test('重试都失败后，把评论作为 context 附在用户的下一条消息上，并确认送达', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], dropSubmit: true, details: { d1: DETAIL('sent') } })
-  await bootAwake($, s)
-  await exhaustRetries(s)
-  const r: any = await userSays($, '继续')
-  await s.clock.settle()
-  expect(r.text).toBe('继续')
-  const sent = s.prompts.at(-1)
-  expect(sent?.text).toBe('继续')
-  expect(sent?.context?.length).toBe(1)
-  expect(sent?.context?.[0]).toContain('[c_1]')
-  expect(sent?.context?.[0]).toContain('改成表格')
-  await tick(s.clock)
-  const acks = s.fetched.filter(f => f.path === '/api/outbox/ack')
-  expect(acks.length).toBe(1)
-  expect(acks[0].body).toEqual({ session: 'sess-1', batch: BATCH.batch })
-  expect(s.toasts).toContain('已收到 1 条评论，Claude 正在处理')
-  // 只附一次；确认后不再发
-  await userSays($, '再继续')
-  expect(s.prompts.at(-1)?.context).toBeUndefined()
-  await ticks(s.clock, 60)
-  expect(s.submitted.length).toBe(4)
-  // 附上的评论算进入了模型：这一轮结束没回复就提醒
-  await turnDone($, s.clock)
-  expect(s.submitted.at(-1)).toContain('c_1')
-})
-
-test('附带评论的用户消息还没进入时，投递定时器不另发这批，进入后只确认一次', async ($, on) => {
-  const o: any = { outbox: [BATCH], dropSubmit: true }
-  const s = stub(on, o)
-  await bootAwake($, s)
-  await exhaustRetries(s)
-  let release: () => void = () => {}
-  o.userGate = new Promise<void>(r => (release = r))
-  o.dropSubmit = false
-  const pending = userSays($, '继续')
-  await s.clock.settle()
-  await ticks(s.clock, 10)
-  expect(s.submitted.length).toBe(4)
-  expect(s.fetched.filter(f => f.path === '/api/outbox/ack').length).toBe(0)
-  release()
-  await pending
-  await s.clock.settle()
-  await ticks(s.clock, 10)
-  expect(s.submitted.length).toBe(4)
-  expect(s.prompts.at(-1)?.context?.[0]).toContain('[c_1]')
-  expect(s.fetched.filter(f => f.path === '/api/outbox/ack').length).toBe(1)
-})
-
-test('附带评论的用户消息被拒后，评论回到队列，投递定时器仍不另发', async ($, on) => {
-  const o: any = { outbox: [BATCH], dropSubmit: true }
-  const s = stub(on, o)
-  await bootAwake($, s)
-  await exhaustRetries(s)
-  o.dropSubmit = false
-  o.refuseUserPrompts = 1
-  await userSays($, '第一条')
-  await ticks(s.clock, 10)
-  expect(s.submitted.length).toBe(4)
-  await userSays($, '第二条')
-  expect(s.prompts.at(-1)?.context?.[0]).toContain('[c_1]')
-})
-
-test('附 context 只挂在用户自己的消息上，不挂在插件、通知等别的来源上', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], dropSubmit: true })
-  await bootAwake($, s)
-  await exhaustRetries(s)
-  await $.prompt.submit({ text: '别的插件', wait: false, origin: { kind: 'plugin', name: 'other' } })
-  await $.prompt.submit({ text: '后台任务完成', wait: false, origin: { kind: 'task-notification' } })
-  expect(s.prompts.map(p => p.context)).toEqual([undefined, undefined])
-  await userSays($, '好', 'sdk')
-  expect(s.prompts.at(-1)?.context?.[0]).toContain('[c_1]')
-})
-
-test('附 context 的消息被拒时评论留着，等下一条', async ($, on) => {
-  const o: any = { outbox: [BATCH], dropSubmit: true }
-  const s = stub(on, o)
-  await bootAwake($, s)
-  await exhaustRetries(s)
-  o.refuseUserPrompts = 1
-  const r: any = await userSays($, '第一条')
-  expect(r.drop).toBe('拒绝')
-  await tick(s.clock)
-  expect(s.fetched.filter(f => f.path === '/api/outbox/ack').length).toBe(0)
-  await userSays($, '第二条')
-  expect(s.prompts.at(-1)?.context?.[0]).toContain('[c_1]')
-})
 
 test('休眠时用户消息原样放行，不碰外部能力', async ($, on) => {
   const s = stub(on, { hasInfo: false })
@@ -1063,8 +799,8 @@ test('休眠时用户消息原样放行，不碰外部能力', async ($, on) => 
   expect(s.ext.calls).toBe(calls)
 })
 
-test('服务没在跑时投递静默跳过，不去启动服务', async ($, on) => {
-  const o: any = { docs: [summary('plan')] }
+test('服务没在跑时取回复静默跳过，不去启动服务', async ($, on) => {
+  const o: any = { docs: [summary('plan')], replies: replyGroups(2) }
   const s = stub(on, o)
   await boot($)
   await s.clock.settle()
@@ -1072,18 +808,7 @@ test('服务没在跑时投递静默跳过，不去启动服务', async ($, on) 
   await tick(s.clock)
   expect(s.spawned.length).toBe(0)
   expect(s.submitted.length).toBe(0)
-})
-
-test('确认送达失败时不重复发进会话，之后重试确认', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], failAcks: 1 })
-  await bootAwake($, s)
-  await tick(s.clock)
-  await tick(s.clock)
-  await tick(s.clock)
-  await tick(s.clock)
-  expect(s.submitted.length).toBe(1)
-  const acks = s.fetched.filter(f => f.path === '/api/outbox/ack')
-  expect(acks.length).toBe(2)
+  expect(s.toasts).toEqual([])
 })
 
 test('斜杠命令注册为 cc-doc-review，避开内置的 /code-review', async ($, on) => {
@@ -1092,635 +817,148 @@ test('斜杠命令注册为 cc-doc-review，避开内置的 /code-review', async
   expect(s.commands).toEqual(['cc-doc-review'])
 })
 
-test('命令注册被拒时工具和投递照常可用，只弹一条提示', async ($, on) => {
-  const s = stub(on, { refuseCommand: true, outbox: [BATCH] })
+test('命令注册被拒时工具和取回复照常可用，只弹一条提示', async ($, on) => {
+  const s = stub(on, { refuseCommand: true, replies: replyGroups(2) })
   await boot($)
   expect(s.toasts.length).toBe(1)
   expect(s.toasts[0]).toContain('/cc-doc-review')
-  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__review_open', path: 'docs/plan.md' })
+  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'docs/plan.md' })
   expect(String(ran.result)).toContain('http://127.0.0.1:4823/review?doc=d1&t=tok')
   await tick(s.clock)
-  expect(s.submitted.length).toBe(1)
-  expect(s.fetched.filter(f => f.path === '/api/outbox/ack').length).toBe(1)
-})
-
-// ── 输入框上方的评审状态带 ──
-
-test('没有未解决评论时状态带不显示', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan')] })
-  await boot($)
-  await refresh(s.clock)
+  expect(s.fetched.some(f => f.path.startsWith('/api/replies?'))).toBe(true)
   const ui = await band($)
-  expect(allText(await ui.drawn())).toBe('engine')
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
   await ui.unmount()
 })
 
-test('服务不在时状态带不显示，也不去启动服务', async ($, on) => {
-  const o: any = { docs: [summary('plan', { sent: 1 })] }
-  const s = stub(on, o)
-  await boot($)
-  await s.clock.settle()
-  o.alive = false
-  await refresh(s.clock)
-  const ui = await band($)
-  expect(allText(await ui.drawn())).toBe('engine')
-  expect(s.spawned.length).toBe(0)
-  await ui.unmount()
-})
+// ── 回复区的唤醒、休眠与服务状态 ──
 
-test('状态带不独占位置：下层（别的插件或引擎）画的内容接在本插件那行下面', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 2 })] })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await band($)
-  const text = allText(await ui.drawn())
-  expect(text).toContain('plan.md')
-  expect(text.endsWith('engine')).toBe(true)
-  // 引擎节点不能放在设了 width 的 Box 下：包着下层内容的 stack、rest 都不设宽度，靠拉伸铺满
-  for (const key of ['stack', 'rest']) {
-    const box: any = await ui.find({ key })
-    expect(box?.props.width).toBeUndefined()
-    expect(box?.props.alignItems).toBe('stretch')
-  }
-  expect(await ui.find({ key: 'rest-card' })).toBeUndefined()
-  await ui.unmount()
-})
-
-test('内层（别的插件）绘制出错时只画评审这一行，并提示一次原因', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 1 })], innerThrows: true })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await band($)
-  const text = allText(await ui.drawn())
-  expect(text).toContain('plan')
-  expect(text).not.toContain('engine')
-  expect(s.toasts.filter((t: string) => t.includes('同一位置的其他插件绘制失败')).length).toBe(1)
-  await ui.unmount()
-})
-
-test('重启后服务不在、本机数据里本会话登记过文档：会话开始就启动服务并唤醒，状态带直接出现', async ($, on) => {
+test('重启后服务不在、本机数据里本会话登记过文档：会话开始就启动服务并唤醒，回复区直接出现', async ($, on) => {
   const s = stub(on, {
     alive: false,
     startsAlive: true,
     newHasDocs: true,
     localDocs: [{ name: 'other.json', session: 'sess-x' }, { name: 'd1.json', session: 'sess-1' }],
-    docs: [summary('plan', { sent: 1 })],
+    docs: [summary('plan')],
+    replies: replyGroups(2),
   })
   await boot($)
   await s.clock.settle()
   expect(s.spawned.some(a => a.join(' ').includes('nohup'))).toBe(true)
-  await refresh(s.clock)
+  await tick(s.clock)
   const ui = await band($)
-  expect(allText(await ui.drawn())).toContain('plan')
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
   await ui.unmount()
 })
 
-test('重启后服务不在、本机数据里没有本会话的文档：不启动服务，保持休眠', async ($, on) => {
-  const s = stub(on, { alive: false, newHasDocs: true, localDocs: [{ name: 'other.json', session: 'sess-x' }], docs: [summary('plan', { sent: 1 })] })
+test('重启后服务不在、本机数据里没有本会话的文档：不启动服务，保持休眠，不取回复', async ($, on) => {
+  const s = stub(on, { alive: false, newHasDocs: true, localDocs: [{ name: 'other.json', session: 'sess-x' }], docs: [summary('plan')], replies: replyGroups(2) })
   await boot($)
   await s.clock.settle()
   expect(s.spawned.length).toBe(0)
-  await refresh(s.clock)
+  await tick(s.clock)
+  expect(s.fetched.some(isReplies)).toBe(false)
   const ui = await band($)
   expect(allText(await ui.drawn())).toBe('engine')
   await ui.unmount()
 })
 
-test('会话开始时服务不在：之后每轮开始再查，服务起来且本会话有文档就唤醒，期间不去启动服务', async ($, on) => {
-  const o: any = { alive: false, docs: [summary('plan', { sent: 1 })] }
+test('会话开始时服务不在：之后每轮开始再查，服务起来且本会话有文档就唤醒并画回复区，期间不去启动服务', async ($, on) => {
+  const o: any = { alive: false, docs: [summary('plan')], replies: replyGroups(2) }
   const s = stub(on, o)
   await boot($)
   await s.clock.settle()
-  await refresh(s.clock)
-  let ui = await band($)
+  await tick(s.clock)
+  const ui = await band($)
   expect(allText(await ui.drawn())).toBe('engine')
-  await ui.unmount()
   // 服务还没起来：这一轮查过仍然休眠
   await $.turn.start({ text: '你好', turnId: 't1' })
   await tick(s.clock)
-  await refresh(s.clock)
-  ui = await band($)
+  await tick(s.clock)
   expect(allText(await ui.drawn())).toBe('engine')
-  await ui.unmount()
-  // 服务起来了：下一轮开始时查到本会话的文档，唤醒并显示状态带
+  // 服务起来了：下一轮开始时查到本会话的文档，唤醒并取回复（检查一次 tick，取回复再一次 tick）
   o.alive = true
   await $.turn.start({ text: '继续', turnId: 't2' })
   await tick(s.clock)
-  await refresh(s.clock)
-  ui = await band($)
-  expect(allText(await ui.drawn())).toContain('plan.md')
+  await tick(s.clock)
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
   expect(s.spawned.length).toBe(0)
   await ui.unmount()
 })
 
-test('单文档（desktop）：一行靠左，「评审」是图标加字，文件是平铺的链接（点了在外部浏览器打开），悬停卡片分标题、数据两区且不放按钮，下层有内容时中间画分隔线', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 2, drafts: 1 }), summary('other')] })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  expect(await ui.find({ key: 'band' })).toMatchObject({ type: 'Box', props: { flexDirection: 'row', justifyContent: 'flex-start' } })
-  // 不再给「评审」和文件套描边框
-  expect(((await ui.find({ key: 'seg:head' })) as any).props.borderStyle).toBeUndefined()
-  expect(((await ui.find({ key: 'seg:plan' })) as any).props.borderStyle).toBeUndefined()
-  expect(await ui.find({ key: 'link:plan' })).toMatchObject({ type: 'Markdown', props: { text: `[plan](${urlOf('plan')})` } })
-  expect(await ui.find({ key: 'open:plan' })).toBeUndefined()
-  // 文件名左边是状态图标
-  expect((await ui.findAll({ type: 'Svg' })).map((n: any) => n.props.alt)).toContain('未发送')
-  const texts = await ui.findAll({ type: 'Text' })
-  expect(texts.find((n: any) => n.text === ' 评审')?.props.color).toBe('claude')
-  // 「评审」卡片是图例：状态名和篇数；文件卡片是全名和「状态 · 目录」
-  const card = allText(await ui.drawn())
-  expect(card).toContain('1 个文档')
-  expect(card).toContain('未发送')
-  expect(card).toContain('1 篇')
-  expect(card).toContain('plan.md')
-  expect(card).toContain('未发送 · docs')
-  expect(card).not.toContain('条评论未解决')
-  // 点药丸就能打开，卡片里不再放按钮
-  expect(await ui.find({ key: 'card-open:plan' })).toBeUndefined()
-  // 悬停卡片：全名、目录、各状态条数
-  const text = allText(await ui.drawn())
-  expect(text).toContain('plan.md')
-  expect(text).toContain('docs')
-  expect(text).toContain('1 个文档')
-  expect(await ui.find({ key: 'copy:plan' })).toBeUndefined()
-  expect(await ui.find({ key: 'divider' })).toMatchObject({ type: 'Box', props: { overflow: 'hidden' } })
-  // 点链接由桌面版直接打开，不经过插件，也不发消息
-  expect(s.submitted.some(t => t.startsWith('请在浏览器面板打开'))).toBe(false)
-  await ui.unmount()
-})
 
-test('下层只有引擎的空内容（只有评审这一块）时不画分隔线', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 1 })], engineEmpty: true })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await band($)
-  expect(allText(await ui.drawn())).toContain('plan')
-  expect(await ui.find({ key: 'divider' })).toBeUndefined()
-  await ui.unmount()
-})
-
-test('单文档（terminal）：一行文字，不画边框，标签是文字，多一个〔复制链接〕', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 2, drafts: 1 })] })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  const text = allText(await ui.drawn())
-  expect(text).toContain('文档评审')
-  expect(text).toContain('未发送')
-  expect((await ui.find({ key: 'doc:plan' }))?.props.borderStyle).toBeUndefined()
-  expect(await ui.find({ key: 'copy:plan' })).toMatchObject({ type: 'Button', props: { label: '复制链接' } })
-  expect(await ui.find({ key: 'open:plan' })).toMatchObject({ type: 'Button', props: { label: '打开' } })
-  await ui.unmount()
-})
-
-test('按评审状态显示：先排轮到你的（未发送、待确认、待评审）；已通过和 24 小时没动静的不显示', async ($, on) => {
-  const s = stub(on, {
-    docs: [
-      summary('busy', { sent: 1, state: 'processing' }),
-      summary('fresh', { state: 'review' }),
-      summary('check', { state: 'confirm' }),
-      summary('draft', { drafts: 1, state: 'draft' }),
-      summary('done', { state: 'approved' }),
-      summary('stale', { state: 'review', changedAt: '2026-10-09T20:00:00Z' }),
-    ],
-  })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await band($, { bodyColumns: 200 })
-  const links = (await ui.findAll({ type: 'Markdown' })).map((n: any) => n.props.text)
-  expect(links).toEqual(['draft', 'check', 'fresh', 'busy'].map(id => `[${id}](${urlOf(id)})`))
-  const alts = (await ui.findAll({ type: 'Svg' })).map((n: any) => n.props.alt)
-  for (const label of ['未发送', '待确认', '待评审', 'Claude 处理中']) expect(alts).toContain(label)
-  const text = allText(await ui.drawn())
-  expect(text).toContain('4 个文档')
-  expect(text).not.toContain('done')
-  expect(text).not.toContain('stale')
-  await ui.unmount()
-})
-
-test('只有待评审的文档时状态带也出现；全部通过后自动隐藏', async ($, on) => {
-  const s = stub(on, { docs: [summary('fresh', { state: 'review' })] })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await band($)
-  expect(await ui.find({ key: 'link:fresh' })).toBeDefined()
-  s.server.docs = [summary('fresh', { state: 'approved' })]
-  await refresh(s.clock)
-  expect(allText(await ui.drawn())).toBe('engine')
-  await ui.unmount()
-})
-
-test('有调查问卷时状态带让位', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 1 })] })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await band($, { hasSurvey: true })
-  expect(allText(await ui.drawn())).toBe('engine')
-  await ui.unmount()
-})
-
-test('数据变化时状态带跟着重画', async ($, on) => {
-  const s = stub(on, { docs: [] })
-  await bootAwake($, s)
-  await refresh(s.clock)
-  const ui = await band($)
-  expect(allText(await ui.drawn())).toBe('engine')
-  s.server.docs = [summary('plan', { drafts: 2 })]
-  await refresh(s.clock)
-  expect(allText(await ui.drawn())).toContain('plan.md')
-  expect(allText(await ui.drawn())).toContain('未发送')
-  await ui.unmount()
-})
-
-test('〔打开评审页〕取当前链接并请 Claude 在浏览器面板打开', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 1 })] })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await terminalBand($)
-  await ui.press({ key: 'open:plan' })
-  // 点文件不重新登记（登记会刷新登记时间，把待确认、已通过的文档误判回待评审）
-  expect(s.fetched.some(f => f.path === '/api/open')).toBe(false)
-  expect(s.submitted.at(-1)).toBe(`请在浏览器面板打开文档评审页：${urlOf('plan')}`)
-  await ui.unmount()
-})
-
-test('有浏览器面板工具：点〔打开〕直接在面板里打开，不发消息、不用等 Claude', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 1 })], browserTool: true })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await terminalBand($)
-  const before = s.submitted.length
-  await ui.press({ key: 'open:plan' })
-  await ui.press({ key: 'open:plan' })
-  expect(s.panelOpened).toEqual([urlOf('plan'), urlOf('plan')])
-  expect(s.submitted.length).toBe(before)
-  // 面板打开成功时不弹提示（面板本身就是反馈）
-  expect(s.toasts.some((t: string) => t.includes('系统浏览器') || t.includes('没能直接打开'))).toBe(false)
-  await ui.unmount()
-})
-
-test('没有浏览器面板工具时用系统浏览器打开并提示', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 1 })], systemOpen: true })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await terminalBand($)
-  const before = s.submitted.length
-  await ui.press({ key: 'open:plan' })
-  expect(s.spawned.some(a => a[0] === 'open' && a[1] === urlOf('plan'))).toBe(true)
-  expect(s.toasts).toContain('已在系统浏览器打开评审页')
-  expect(s.submitted.length).toBe(before)
-  await ui.unmount()
-})
-
-test('内置浏览器被权限拦下（自动模式）：立刻用系统浏览器打开并说明原因，不发消息给 Claude', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 1 })], browserTool: true, panelDenied: true, systemOpen: true })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await terminalBand($)
-  const before = s.submitted.length
-  await ui.press({ key: 'open:plan' })
-  expect(s.panelOpened).toEqual([urlOf('plan')])
-  expect(s.spawned.some(a => a[0] === 'open' && a[1] === urlOf('plan'))).toBe(true)
-  expect(s.toasts).toContain('内置浏览器被权限拦下，已在系统浏览器打开评审页')
-  expect(s.submitted.length).toBe(before)
-  await ui.unmount()
-})
-
-test('面板收着看不见时也改用系统浏览器', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 1 })], browserTool: true, systemOpen: true, panelHidden: true })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await terminalBand($)
-  await ui.press({ key: 'open:plan' })
-  expect(s.spawned.some(a => a[0] === 'open')).toBe(true)
-  expect(s.toasts).toContain('内置浏览器面板是收起的，已在系统浏览器打开评审页')
-  await ui.unmount()
-})
-
-test('内置浏览器打不开、系统浏览器也打不开：退回请 Claude 打开并说明原因', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 1 })], browserTool: true, panelFails: true })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await terminalBand($)
-  await ui.press({ key: 'open:plan' })
-  expect(s.toasts.some((t: string) => t.includes('系统浏览器也打不开，已请 Claude 打开'))).toBe(true)
-  expect(s.submitted.at(-1)).toBe(`请在浏览器面板打开文档评审页：${urlOf('plan')}`)
-  await ui.unmount()
-})
-
-test('/cc-doc-review 登记后直接在浏览器面板打开，不再发消息请 Claude 打开', async ($, on) => {
-  const s = stub(on, { browserTool: true })
-  await boot($)
-  const before = s.submitted.length
-  const r: any = await $.command.run({ command: 'cc-doc-review', args: 'docs/plan.md' } as any)
-  expect(String(r.text)).toContain('已在浏览器面板打开')
-  expect(s.panelOpened).toEqual([URL_D1])
-  expect(s.submitted.length).toBe(before)
-})
-
-test('〔打开评审页〕连点只发一次请求，每次点击都有提示；10 秒后可以再发', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 1 })] })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await terminalBand($)
-  await ui.press({ key: 'open:plan' })
-  await ui.press({ key: 'open:plan' })
-  await ui.press({ key: 'open:plan' })
-  const asked = () => s.submitted.filter(t => t.startsWith('请在浏览器面板打开文档评审页')).length
-  expect(asked()).toBe(1)
-  expect(s.toasts.filter(t => t.includes('已请求 Claude 在浏览器面板打开评审页')).length).toBe(1)
-  expect(s.toasts.filter(t => t.includes('已经请求过打开这个评审页')).length).toBe(2)
-  await s.clock.advance(10_000)
-  await ui.press({ key: 'open:plan' })
-  expect(asked()).toBe(2)
-  await ui.unmount()
-})
-
-test('〔复制链接〕复制到按下的那个界面的剪贴板', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 1 })] })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  await ui.press({ key: 'copy:plan' })
-  expect(s.copied.at(-1)).toMatchObject({ text: urlOf('plan'), surface: 'terminal' })
-  expect(s.toasts).toContain('评审链接已复制')
-  expect(s.filled.length).toBe(0)
-  await ui.unmount()
-})
-
-test('复制失败时提示原因，并把链接填进输入框', async ($, on) => {
-  const s = stub(on, { docs: [summary('plan', { sent: 1 })], copy: { isCopied: false, reason: 'no-clipboard' } })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  await ui.press({ key: 'copy:plan' })
-  expect(s.filled).toEqual([urlOf('plan')])
-  expect(s.toasts.at(-1)).toContain('复制失败')
-  expect(s.toasts.at(-1)).toContain('剪贴板')
-  await ui.unmount()
-})
-
-test('多文档（terminal）：逐个列出有未解决评论的文档，〔打开〕打开对应文档', async ($, on) => {
-  const s = stub(on, {
-    docs: [summary('a', { sent: 1 }), summary('b', { drafts: 2, sent: 1 }), summary('c')],
-  })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await terminalBand($)
-  const text = allText(await ui.drawn())
-  expect(text).toContain('2 个文档')
-  expect(text).toContain('a.md')
-  expect(text).toContain('b.md')
-  expect(text).not.toContain('c.md')
-  expect(await ui.find({ key: 'toggle' })).toBeUndefined()
-  await ui.press({ key: 'open:b' })
-  expect(s.submitted.at(-1) ?? '').toContain('doc=b&')
-  expect(s.submitted.at(-1)).toContain('请在浏览器面板打开文档评审页：')
-  await ui.unmount()
-})
-
-test('文件多（desktop）：按状态带宽度放得下几个就放几个，其余收进「+N」，悬停卡片里逐个列出并可打开', async ($, on) => {
-  const ids = ['a', 'b', 'c', 'd', 'e', 'f']
-  const s = stub(on, { docs: ids.map(id => summary(id, { sent: 1 })) })
-  await boot($)
-  await refresh(s.clock)
-  // 窄：只放得下前两个
-  const narrow = await band($, { bodyColumns: 23 })
-  expect(await narrow.find({ key: 'seg:b' })).toBeDefined()
-  expect(await narrow.find({ key: 'seg:c' })).toBeUndefined()
-  expect((await narrow.findAll({ type: 'Text' })).some((n: any) => n.text === '+4')).toBe(true)
-  // 收起的文件在悬停卡片里也是同样的链接
-  expect(await narrow.find({ key: 'link:f' })).toMatchObject({ type: 'Markdown', props: { text: `[f](${urlOf('f')})` } })
-  expect(await narrow.find({ key: 'toggle' })).toBeUndefined()
-  await narrow.unmount()
-  // 宽：全部放下，没有「+N」
-  const wide = await band($, { bodyColumns: 200 })
-  for (const id of ids) expect(await wide.find({ key: `seg:${id}` })).toBeDefined()
-  expect(await wide.find({ key: 'seg:more' })).toBeUndefined()
-  await wide.unmount()
-})
-
-test('文档超过 3 个（terminal）：只列前 3 个和「还有 N 个文档」，〔展开〕列出全部，〔收起〕还原', async ($, on) => {
-  const ids = ['a', 'b', 'c', 'd', 'e', 'f']
-  const s = stub(on, { docs: ids.map(id => summary(id, { sent: 1 })) })
-  await boot($)
-  await refresh(s.clock)
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  let text = allText(await ui.drawn())
-  expect(text).toContain('c.md')
-  expect(text).not.toContain('d.md')
-  expect(text).toContain('还有 3 个文档')
-  await ui.press({ key: 'toggle' })
-  text = allText(await ui.drawn())
-  expect(text).toContain('f.md')
-  expect(text).toContain('共 6 个文档')
-  await ui.press({ key: 'toggle' })
-  expect(allText(await ui.drawn())).not.toContain('f.md')
-  await ui.unmount()
-})
-
-// ── 一轮结束时检查漏回复的评论 ──
-
-const DETAIL = (status: string) => ({ id: 'd1', comments: [{ id: 'c_1', status }] })
-const hasReminder = async (ui: any) => allText(await ui.drawn()).includes('⚠')
-
-test('一轮结束还有评论没回复：自动提醒 Claude 一次并弹提示，状态带变提醒但没有〔提醒 Claude〕按钮', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], details: { d1: DETAIL('sent') } })
-  await bootAwake($, s)
-  await deliverAndStart($, s)
-  const before = s.submitted.length
-  await turnDone($, s.clock)
-  expect(s.submitted.length).toBe(before + 1)
-  expect(s.submitted.at(-1)).toContain('c_1')
-  expect(s.submitted.at(-1)).toContain('review_resolve')
-  expect(s.toasts).toContain('还有 1 条评论没回复处理结果，已提醒 Claude')
-  const ui = await band($)
-  expect(allText(await ui.drawn())).toContain('⚠ 还有 1 条评论没回复处理结果')
-  expect(await ui.find({ key: 'remind' })).toBeUndefined()
-  expect(await ui.find({ key: 'dismiss' })).toMatchObject({ type: 'Button' })
-  await ui.unmount()
-})
-
-test('自动提醒每批评论最多一次：提醒那一轮结束后仍没回复，不再提醒', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], details: { d1: DETAIL('sent') } })
-  await bootAwake($, s)
-  await deliverAndStart($, s)
-  await turnDone($, s.clock)
-  const after = s.submitted.length
-  // 提醒的那一轮开始、结束，评论还是没回复
-  await $.turn.start({ text: s.submitted.at(-1), turnId: 't2' })
-  await turnDone($, s.clock)
-  await turnDone($, s.clock)
-  expect(s.submitted.length).toBe(after)
-  expect(s.toasts.filter((t: string) => t.includes('已提醒 Claude')).length).toBe(1)
-})
-
-test('新一批评论进入模型后，没回复时再提醒一次，名单含之前没回复的', async ($, on) => {
-  const second = { ...BATCH, batch: 'b_20261011_100600_cd34', comments: [{ id: 'c_2', quote: 'x', body: 'y' }] }
-  const s = stub(on, {
-    outbox: [BATCH],
-    details: { d1: { id: 'd1', comments: [{ id: 'c_1', status: 'sent' }, { id: 'c_2', status: 'sent' }] } },
-  })
-  await bootAwake($, s)
-  await deliverAndStart($, s)
-  await turnDone($, s.clock)
-  s.server.outbox = [second]
-  await deliverAndStart($, s)
-  await turnDone($, s.clock)
-  expect(s.submitted.at(-1)).toContain('c_1')
-  expect(s.submitted.at(-1)).toContain('c_2')
-  expect(s.toasts).toContain('还有 2 条评论没回复处理结果，已提醒 Claude')
-  expect(s.toasts.filter((t: string) => t.includes('已提醒 Claude')).length).toBe(2)
-})
-
-test('自动提醒发不出去时只弹提示，不重试、不填输入框', async ($, on) => {
-  const o: any = { outbox: [BATCH], details: { d1: DETAIL('sent') } }
+test('/cc-doc-review 带文件：登记并在系统浏览器打开，返回链接；打不开时只返回链接', async ($, on) => {
+  const o: any = { systemOpen: true }
   const s = stub(on, o)
-  await bootAwake($, s)
-  await deliverAndStart($, s)
-  // 之后本插件发的都被拒
-  o.dropSubmit = true
-  const before = s.submitted.length
-  await turnDone($, s.clock)
-  await turnDone($, s.clock)
-  await ticks(s.clock, 120)
-  expect(s.submitted.length).toBe(before + 1)
-  expect(s.filled).toEqual([])
-  expect(s.toasts.at(-1)).toContain('还有 1 条评论没回复处理结果')
-  expect(s.toasts.at(-1)).toContain('没能提醒')
+  await boot($)
+  let r: any = await $.command.run({ command: 'cc-doc-review', args: 'docs/plan.md' } as any)
+  expect(String(r.text)).toBe(`已登记 docs/plan.md，已在系统浏览器打开：${URL_D1}&lang=zh`)
+  expect(s.spawned.some(a => a[0] === 'open' && a[1] === `${URL_D1}&lang=zh`)).toBe(true)
+  o.systemOpen = false
+  r = await $.command.run({ command: 'cc-doc-review', args: 'docs/plan.md' } as any)
+  expect(String(r.text)).toBe(`已登记 docs/plan.md：${URL_D1}&lang=zh`)
+  expect(s.submitted).toEqual([])
 })
 
-test('都回复了就不提醒', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], details: { d1: DETAIL('resolved') } })
-  await bootAwake($, s)
-  await deliverAndStart($, s)
-  await turnDone($, s.clock)
-  const ui = await band($)
-  expect(await hasReminder(ui)).toBe(false)
-  await ui.unmount()
+const docRow = (id: string, o: any = {}) => ({
+  id,
+  path: `/proj/docs/${id}.md`,
+  kind: 'md',
+  openedAt: '2026-10-10T23:50:00Z',
+  pending: 0,
+  ...o,
 })
 
-test('评论还没进入模型（排队中，前一轮先结束）时不提醒，进入后那一轮结束才提醒', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], details: { d1: DETAIL('sent') } })
-  await bootAwake($, s)
-  await tick(s.clock)
-  // 前一轮结束：这批评论的消息还没开始一轮
-  await turnDone($, s.clock)
-  const ui = await band($)
-  expect(await hasReminder(ui)).toBe(false)
-  await $.turn.start({ text: s.submitted.at(-1), turnId: 't2' })
-  await turnDone($, s.clock)
-  expect(await hasReminder(ui)).toBe(true)
-  await ui.unmount()
-})
-
-test('发不进会话（等重试）时不提醒，也不填输入框', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], dropSubmit: true, details: { d1: DETAIL('sent') } })
-  await bootAwake($, s)
-  await tick(s.clock)
-  await turnDone($, s.clock)
-  expect(s.submitted.length).toBe(1)
-  expect(s.filled).toEqual([])
-  expect(s.toasts.some((t: string) => t.includes('已提醒 Claude'))).toBe(false)
-  const ui = await band($)
-  expect(await hasReminder(ui)).toBe(false)
-  await ui.unmount()
-})
-
-test('被中断或出错的一轮不提醒', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], details: { d1: DETAIL('sent') } })
-  await bootAwake($, s)
-  await deliverAndStart($, s)
-  await turnDone($, s.clock, { isAborted: true, reason: 'aborted' })
-  await turnDone($, s.clock, { reason: 'error' })
-  const ui = await band($)
-  expect(await hasReminder(ui)).toBe(false)
-  await ui.unmount()
-})
-
-test('点〔×〕后不再提醒，直到下一批评论进入模型', async ($, on) => {
-  const second = { ...BATCH, batch: 'b_20261011_100600_cd34', comments: [{ id: 'c_2', quote: 'x', body: 'y' }] }
+test('/cc-doc-review 不带参数：在聊天里列出本会话的文档，链接带 lang，目录 · 时间，有待发送回复时带条数', async ($, on) => {
   const s = stub(on, {
-    outbox: [BATCH],
-    details: { d1: { id: 'd1', comments: [{ id: 'c_1', status: 'sent' }, { id: 'c_2', status: 'sent' }] } },
+    docs: [docRow('a', { pending: 2, modifiedAt: '2026-10-10T23:58:00Z' }), docRow('b[x]', { openedAt: '2026-10-10T23:30:00Z', modifiedAt: '2026-10-10T23:40:00Z' })],
   })
-  await bootAwake($, s)
-  await deliverAndStart($, s)
-  await turnDone($, s.clock)
-  const ui = await band($)
-  await ui.press({ key: 'dismiss' })
-  expect(await hasReminder(ui)).toBe(false)
-  await turnDone($, s.clock)
-  expect(await hasReminder(ui)).toBe(false)
-  // 下一批送达并进入模型后，那一轮结束重新提醒
-  s.server.outbox = [second]
-  await deliverAndStart($, s)
-  await turnDone($, s.clock)
-  expect(allText(await ui.drawn())).toContain('⚠ 还有 2 条评论没回复处理结果')
-  await ui.unmount()
+  await boot($)
+  const r: any = await $.command.run({ command: 'cc-doc-review', args: '' } as any)
+  expect(String(r.text)).toBe(
+    [
+      '本会话的文档（2 份）：',
+      '- [a](http://127.0.0.1:4823/review?doc=a&t=tok&lang=zh) · docs · 2 分钟前 · 2 条回复待发送',
+      '- [b\\[x\\]](http://127.0.0.1:4823/review?doc=b%5Bx%5D&t=tok&lang=zh) · docs · 20 分钟前',
+    ].join('\n'),
+  )
+  expect(s.fetched.some(f => f.path === '/api/docs?session=sess-1')).toBe(true)
+  expect(s.submitted).toEqual([])
 })
 
-test('提醒的评论全部解决后自动退出提醒', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], details: { d1: DETAIL('sent') } })
-  await bootAwake($, s)
-  await deliverAndStart($, s)
-  await turnDone($, s.clock)
-  const ui = await band($)
-  expect(await hasReminder(ui)).toBe(true)
-  s.server.details.d1 = DETAIL('resolved')
-  await refresh(s.clock)
-  expect(await hasReminder(ui)).toBe(false)
-  await ui.unmount()
+test('/cc-doc-review 不带参数：英文界面用英文标题，时间用英文', async ($, on) => {
+  const s = stub(on, { language: 'English', docs: [docRow('a', { modifiedAt: '2026-10-10T23:58:00Z' })] })
+  await boot($)
+  const r: any = await $.command.run({ command: 'cc-doc-review', args: '' } as any)
+  expect(String(r.text)).toBe('Docs in this session (1):\n- [a](http://127.0.0.1:4823/review?doc=a&t=tok&lang=en) · docs · 2 min ago')
+  void s
 })
 
-test('文档已不存在（404）的评论不再跟踪，提醒随之消失', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], details: { d1: DETAIL('sent') } })
-  await bootAwake($, s)
-  await deliverAndStart($, s)
-  await turnDone($, s.clock)
-  const ui = await band($)
-  expect(await hasReminder(ui)).toBe(true)
-  delete s.server.details.d1
-  await refresh(s.clock)
-  expect(await hasReminder(ui)).toBe(false)
-  // 已从跟踪里移除：文档回来了也不再提醒、不再去查
-  s.server.details.d1 = DETAIL('sent')
-  const before = s.fetched.filter(f => f.path.startsWith('/api/doc?')).length
-  await turnDone($, s.clock)
-  expect(await hasReminder(ui)).toBe(false)
-  expect(s.fetched.filter(f => f.path.startsWith('/api/doc?')).length).toBe(before)
-  await ui.unmount()
+test('/cc-doc-review 不带参数：本会话没有文档时提示', async ($, on) => {
+  const s = stub(on)
+  await boot($)
+  const r: any = await $.command.run({ command: 'cc-doc-review', args: '' } as any)
+  expect(String(r.text)).toBe('本会话还没有文档')
+  void s
 })
 
-test('服务暂时不可达时保留提醒，不清空', async ($, on) => {
-  const o: any = { outbox: [BATCH], details: { d1: DETAIL('sent') } }
-  const s = stub(on, o)
-  await bootAwake($, s)
-  await deliverAndStart($, s)
-  await turnDone($, s.clock)
-  const ui = await band($)
-  expect(await hasReminder(ui)).toBe(true)
-  o.alive = false
-  await turnDone($, s.clock)
-  await refresh(s.clock)
-  expect(await hasReminder(ui)).toBe(true)
-  o.alive = true
-  s.server.details.d1 = DETAIL('resolved')
-  await refresh(s.clock)
-  expect(await hasReminder(ui)).toBe(false)
-  await ui.unmount()
+test('/cc-doc-review 不带参数：服务不在就启动它再列', async ($, on) => {
+  const s = stub(on, { alive: false, startsAlive: true, docs: [docRow('a')] })
+  await boot($)
+  const pending: Promise<any> = $.command.run({ command: 'cc-doc-review', args: '' } as any)
+  await s.clock.advance(4000)
+  const r = await pending
+  expect(s.spawned.some(a => a[0] === '/bin/sh' && a[2].includes('nohup'))).toBe(true)
+  expect(String(r.text)).toContain('- [a](')
 })
 
-test('子代理的一轮结束不触发检查', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], details: { d1: DETAIL('sent') } })
-  await bootAwake($, s)
-  await deliverAndStart($, s)
-  await turnDone($, s.clock, { agentId: 'agent-1' })
-  expect(s.fetched.some(f => f.path.startsWith('/api/doc?'))).toBe(false)
-  const ui = await band($)
-  expect(await hasReminder(ui)).toBe(false)
-  await ui.unmount()
+test('/cc-doc-review 不带参数：服务起不来时报打开失败', async ($, on) => {
+  const s = stub(on, { alive: false })
+  await boot($)
+  const pending: Promise<any> = $.command.run({ command: 'cc-doc-review', args: '' } as any)
+  await s.clock.advance(4000)
+  const r = await pending
+  expect(String(r.text)).toContain('打开失败：文档服务启动失败')
 })
 
 // ── 按文件夹自动登记 ──
@@ -1744,7 +982,8 @@ test('写进 docs / specs / plans 目录的文档自动登记评审，同一文�
   await write($, s, '/proj/docs/specs/design.md', 'Edit')
   await write($, s, '/proj/plans/rollout.html', 'Edit')
   expect(opened(s)).toEqual(['/proj/docs/specs/design.md', '/proj/plans/rollout.html'])
-  expect(s.toasts).toEqual(['已登记评审：design.md', '已登记评审：rollout.html'])
+  // 不弹「已登记」：Claude 回话里的链接和 /cc-doc-review 列表就是入口
+  expect(s.toasts).toEqual([])
 })
 
 test('同一文件并发写两次只登记一次', async ($, on) => {
@@ -1758,12 +997,13 @@ test('同一文件并发写两次只登记一次', async ($, on) => {
   expect(opened(s)).toEqual(['/proj/docs/a.md'])
 })
 
-test('不在评审目录、被排除、在工作目录外的文件不登记', async ($, on) => {
+test('不是文档、被排除、在工作目录外的文件不登记', async ($, on) => {
   const s = stub(on)
   await boot($)
   for (const file_path of [
-    '/proj/src/notes.md',
+    '/proj/src/notes.txt',
     '/proj/docs/README.md',
+    '/proj/AGENTS.md',
     '/proj/docs/CLAUDE.md',
     '/proj/.superpowers/docs/x.md',
     '/proj/node_modules/p/docs/x.md',
@@ -1853,14 +1093,14 @@ test('自动登记失败只提示一次、不影响工具结果，并退避一�
   await write($, s, '/proj/docs/b.md')
   expect(r.result).toBe('wrote /proj/docs/a.md')
   expect(s.toasts.length).toBe(1)
-  expect(s.toasts[0]).toContain('自动登记评审失败')
+  expect(s.toasts[0]).toContain('自动登记文档失败')
   // 退避期内不再尝试
   expect(opened(s)).toEqual(['/proj/docs/a.md'])
   o.openFails = false
   await s.clock.advance(61_000)
   await write($, s, '/proj/docs/a.md')
   expect(opened(s)).toEqual(['/proj/docs/a.md', '/proj/docs/a.md'])
-  expect(s.toasts.at(-1)).toBe('已登记评审：a.md')
+  expect(s.toasts.length).toBe(1)
 })
 
 // ── 休眠模式：会话开始时休眠，用到评审才唤醒 ──
@@ -1873,27 +1113,30 @@ const COMPOSE = {
   outputStyle: null,
   traits: [],
 }
-const isOutbox = (f: any) => f.path.startsWith('/api/outbox?')
-/** 唤醒的标志：投递定时器在跑（每秒查一次 outbox）。*/
+const isReplies = (f: any) => f.path.startsWith('/api/replies?')
+/** 唤醒的标志：回复定时器在跑（每秒取一次 /api/replies）。*/
 async function isAwake(s: any) {
-  const before = s.fetched.filter(isOutbox).length
+  const before = s.fetched.filter(isReplies).length
   await tick(s.clock)
-  return s.fetched.filter(isOutbox).length > before
+  return s.fetched.filter(isReplies).length > before
 }
 
-test('休眠：服务没在跑时零 HTTP、零进程，定时器空转，状态带让位，一轮结束直接放行', async ($, on) => {
-  const s = stub(on, { hasInfo: false, outbox: [BATCH], details: { d1: DETAIL('sent') } })
+test('休眠：服务没在跑时零 HTTP、零进程，定时器空转，不取回复、不画回复区，一轮结束直接放行', async ($, on) => {
+  const s = stub(on, { hasInfo: false, replies: replyGroups(2) })
   await boot($)
   await s.clock.settle()
-  // 会话开始那次检查之后：定时器 tick、一轮开始与结束、画状态带都不碰任何外部能力
+  // 会话开始那次检查之后：定时器 tick、一轮开始与结束都不碰任何外部能力
   const calls = s.ext.calls
   await s.clock.advance(60_000)
   await $.turn.start({ text: '你好', turnId: 't1' })
   await turnDone($, s.clock)
+  expect(s.ext.calls).toBe(calls)
+  expect(s.fetched.some(isReplies)).toBe(false)
+  // 休眠时回复区整块让给下层，画它也不碰外部能力
   const ui = await band($)
   expect(allText(await ui.drawn())).toBe('engine')
-  await ui.unmount()
   expect(s.ext.calls).toBe(calls)
+  await ui.unmount()
   // 没命中的写入：只做路径匹配，不联网、不提示
   await write($, s, '/proj/src/a.ts')
   expect(s.fetched).toEqual([])
@@ -1903,7 +1146,7 @@ test('休眠：服务没在跑时零 HTTP、零进程，定时器空转，状态
 })
 
 test('休眠：服务在跑但本会话没有文档时，只在会话开始查一次', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH] })
+  const s = stub(on, { replies: replyGroups(2) })
   await boot($)
   await s.clock.settle()
   expect(s.fetched.map(f => f.path)).toEqual(['/api/health', '/api/docs?session=sess-1'])
@@ -1912,10 +1155,13 @@ test('休眠：服务在跑但本会话没有文档时，只在会话开始查�
   await turnDone($, s.clock)
   expect(s.fetched.length).toBe(2)
   expect(s.submitted).toEqual([])
+  const ui = await band($)
+  expect(allText(await ui.drawn())).toBe('engine')
+  await ui.unmount()
   expect(s.ext.calls).toBe(calls)
 })
 
-test('系统提示不加评审规则（休眠和唤醒后都不加），规则写在 review_open 的说明里', async ($, on) => {
+test('系统提示不加规则（休眠和唤醒后都不加），规则写在 open_doc 的说明里', async ($, on) => {
   const s = stub(on)
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'base', scope: 'shared' }] }))
   await boot($)
@@ -1924,27 +1170,20 @@ test('系统提示不加评审规则（休眠和唤醒后都不加），规则�
   await wake($, s)
   const awake: any = await $.prompt.compose(COMPOSE)
   expect(awake.sections.map((x: any) => x.id)).toEqual(['intro'])
-  const desc = String(s.tools.review_open?.description)
-  expect(desc).toContain('浏览器面板')
-  expect(desc).toContain('子代理不要调用')
-  expect(desc).toContain('[文档评审]')
-  expect(desc).toContain('mcp__cc-doc-review__review_resolve')
+  const desc = String(s.tools.open_doc?.description)
+  expect(desc).toContain('not a review')
+  expect(desc).toContain('never from a subagent')
+  expect(desc).toContain('[文档回复]')
+  expect(desc).toContain('[Doc reply]')
+  expect(desc).toContain('Answer every reply')
   expect(desc).toContain('README')
 })
 
-test('唤醒：调用 review_open', async ($, on) => {
+test('唤醒：调用 open_doc', async ($, on) => {
   const s = stub(on)
   await boot($)
   expect(await isAwake(s)).toBe(false)
-  await $.tool.call({ tool: 'mcp__cc-doc-review__review_open', path: 'docs/plan.md' })
-  expect(await isAwake(s)).toBe(true)
-})
-
-test('唤醒：调用 review_resolve（即使失败）', async ($, on) => {
-  const s = stub(on)
-  await boot($)
-  const ran: any = await $.tool.call({ tool: 'mcp__cc-doc-review__review_resolve', items: [{ id: 'c_gone1', note: 'x' }] })
-  expect(String(ran.deny)).toContain('c_gone1')
+  await $.tool.call({ tool: 'mcp__cc-doc-review__open_doc', path: 'docs/plan.md' })
   expect(await isAwake(s)).toBe(true)
 })
 
@@ -1966,9 +1205,9 @@ test('唤醒：只带空参数的命令也唤醒（用户用了评审）', async
 test('唤醒：自动登记命中；没命中的写入不唤醒', async ($, on) => {
   const s = stub(on)
   await boot($)
-  await write($, s, '/proj/src/a.md')
+  await write($, s, '/proj/src/a.ts')
   expect(await isAwake(s)).toBe(false)
-  await write($, s, '/proj/docs/a.md')
+  await write($, s, '/proj/src/a.md')
   expect(await isAwake(s)).toBe(true)
 })
 
@@ -1990,54 +1229,63 @@ test('会话开始时服务没在跑：不启动服务、不唤醒', async ($, o
   expect(s.ext.calls).toBe(calls)
 })
 
-test('唤醒后投递正常：休眠时不投递，唤醒后发进会话并确认送达', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH] })
+test('唤醒后取回复正常：休眠时不取、不画回复区，唤醒后取到就画出回复区', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(2) })
   await boot($)
   await tick(s.clock)
   await tick(s.clock)
-  expect(s.submitted).toEqual([])
-  await wake($, s)
-  await tick(s.clock)
-  expect(s.submitted.length).toBe(1)
-  expect(s.submitted[0]).toContain('[文档评审]')
-  expect(s.fetched.filter(f => f.path === '/api/outbox/ack').length).toBe(1)
-})
-
-test('唤醒后下一秒就取状态，不等 2 秒的刷新周期', async ($, on) => {
-  const s = stub(on, { docs: [] })
-  await boot($)
-  await s.clock.advance(1500) // 错开刷新周期：下一次 2 秒刷新在 0.5 秒后的再下一秒
-  s.server.docs = [summary('plan', { sent: 1 })]
-  await wake($, s)
-  await tick(s.clock)
+  expect(s.fetched.filter(isReplies).length).toBe(0)
   const ui = await band($)
-  expect(allText(await ui.drawn())).toContain('plan.md')
+  expect(allText(await ui.drawn())).toBe('engine')
+  await wake($, s)
+  await tick(s.clock)
+  expect(s.fetched.filter(isReplies).length).toBe(1)
+  expect(await titleOf(ui)).toBe('2 条回复')
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
   await ui.unmount()
 })
 
-test('/clear 后复位为休眠：定时器空转、状态带让位、提醒清空，再用到评审时用同一组定时器重新唤醒', async ($, on) => {
-  const s = stub(on, { outbox: [BATCH], details: { d1: DETAIL('sent') }, docs: [summary('plan', { sent: 1 })] })
+test('唤醒后下一秒就取回复并画出回复区', async ($, on) => {
+  const s = stub(on)
+  await boot($)
+  await s.clock.advance(1500) // 错开整秒：唤醒后下一次定时器 tick 就该取回复
+  s.server.replies = replyGroups(2)
+  await wake($, s)
+  await tick(s.clock)
+  const ui = await band($)
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
+  await ui.unmount()
+})
+
+test('/clear 后复位为休眠：定时器空转、不再取回复、回复区收起、回复清空，再用到评审时用同一组定时器重新唤醒，新回复照常画', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(2), docs: [summary('plan')] })
   await boot($)
   await s.clock.settle()
-  await deliverAndStart($, s)
-  await turnDone($, s.clock)
+  await tick(s.clock)
   const ui = await band($)
-  expect(await hasReminder(ui)).toBe(true)
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
   await endSession($, s)
   s.server.session = 'sess-2'
+  // 新会话里的回复（ID 和旧会话的不同）
+  s.server.replies = replyGroups(1).map(g => ({ ...g, replies: g.replies.map((r: any) => ({ ...r, id: 'c_9', quote: '新原文', body: '新回复' })) }))
   const calls = s.ext.calls
   await s.clock.advance(30_000)
   await turnDone($, s.clock)
   expect(s.ext.calls).toBe(calls)
-  expect(allText(await ui.drawn())).toBe('engine')
-  await ui.unmount()
-  // 新会话里再用到评审：重新唤醒，按新会话 ID 投递
+  // 回复区收起，让给下层（这里按新画的来看）
+  const fresh = await band($)
+  expect(allText(await fresh.drawn())).toBe('engine')
+  // 新会话里再用到评审：重新唤醒，按新会话 ID 取回复并画出来，旧会话的回复不会回来
   await wake($, s)
   await tick(s.clock)
-  expect(s.fetched.some(f => f.path === '/api/outbox?session=sess-2')).toBe(true)
+  expect(s.fetched.some(f => f.path === '/api/replies?session=sess-2')).toBe(true)
+  expect(await rowIds(fresh)).toEqual(['c_9'])
+  expect(svgAlts(await fresh.find({ key: 'r:c_9:art' }))).toEqual(['1 新原文 新回复'])
+  await fresh.unmount()
+  await ui.unmount()
 })
 
-test('会话结束（退出）：复位为休眠，之后没有任何外部调用，再次唤醒仍可投递', async ($, on) => {
+test('会话结束（退出）：复位为休眠，之后没有任何外部调用，再次唤醒仍可取回复并画出回复区', async ($, on) => {
   const s = stub(on)
   await bootAwake($, s)
   await endSession($, s, 'prompt_input_exit')
@@ -2045,13 +1293,13 @@ test('会话结束（退出）：复位为休眠，之后没有任何外部调�
   const calls = s.ext.calls
   await s.clock.advance(30_000)
   expect(s.ext.calls).toBe(calls)
-  // 再次唤醒后恢复投递
-  s.server.outbox = [BATCH]
+  // 再次唤醒后恢复取回复
+  s.server.replies = replyGroups(2)
   await wake($, s)
   await tick(s.clock)
-  await tick(s.clock)
-  expect(s.submitted.length).toBe(1)
-  expect(s.fetched.filter(f => f.path === '/api/outbox/ack').length).toBe(1)
+  const ui = await band($)
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
+  await ui.unmount()
 })
 
 test('会话开始的检查在 /clear 之后才返回时不唤醒新会话', async ($, on) => {
@@ -2138,7 +1386,7 @@ test('提示文字：首次使用与插件更新不同，不支持的平台和 u
   const first = stub(on, { ...FRESH, startsAlive: true })
   await boot($)
   await openOnce($, first)
-  expect(first.toasts).toContain('文档评审：首次使用，正在下载评审服务')
+  expect(first.toasts).toContain('cc-doc-review：首次使用，正在下载文档服务')
   expect(first.toasts.some((t: string) => t.includes('插件已更新'))).toBe(false)
 })
 
@@ -2146,7 +1394,7 @@ test('插件更新后换新版：提示正在准备新版，不说首次使用',
   const s = stub(on, { hasBinary: false, serverVersion: '0.1.0', startsAlive: true })
   await boot($)
   await openOnce($, s)
-  expect(s.toasts).toContain('文档评审：插件已更新，正在准备新版评审服务')
+  expect(s.toasts).toContain('cc-doc-review：插件已更新，正在准备新版文档服务')
   expect(s.toasts.some((t: string) => t.includes('首次使用'))).toBe(false)
 })
 
@@ -2154,7 +1402,7 @@ test('不支持的平台不提示下载', async ($, on) => {
   const s = stub(on, { ...FRESH, uname: 'FreeBSD amd64\n', goShell: '/bin/zsh', startsAlive: true })
   await boot($)
   await openOnce($, s)
-  expect(s.toasts.some((t: string) => t.includes('下载评审服务'))).toBe(false)
+  expect(s.toasts.some((t: string) => t.includes('下载文档服务'))).toBe(false)
   expect(s.toasts.some((t: string) => t.includes('本地编译'))).toBe(true)
 })
 
@@ -2166,7 +1414,7 @@ test('uname 执行失败：报告真实原因而不是「不支持的平台」',
   expect(String(ran.deny)).toContain('找不到命令')
   expect(String(ran.deny)).not.toContain('不支持的平台')
   expect(argvOf(s, 'curl').length).toBe(0)
-  expect(s.toasts.some((t: string) => t.includes('下载评审服务'))).toBe(false)
+  expect(s.toasts.some((t: string) => t.includes('下载文档服务'))).toBe(false)
 })
 
 test('用版本化程序启动失败：删掉这个程序，下次重新获取', async ($, on) => {
@@ -2183,4 +1431,791 @@ test('开发模式启动失败：不删程序', async ($, on) => {
   const ran = await openOnce($, s)
   expect(String(ran.deny)).toContain('启动失败')
   expect(argvOf(s, 'rm').length).toBe(0)
+})
+
+// ---- 输入框上方的回复区 ----
+
+const BAND = {
+  plugin: 'cc-doc-review',
+  component: 'AbovePrompt',
+  surface: 'desktop',
+  viewport: { columns: 120, rows: 40 },
+  props: {
+    hasSurvey: false,
+    isWorking: false,
+    maxRows: 10,
+    bodyColumns: 115,
+    scroll: { offset: 0, bodyRows: 10 },
+    view: {},
+  },
+} as const
+
+async function band($: any, props: any = {}, extra: any = {}) {
+  return $.ui.mount({ ...BAND, ...extra, props: { ...BAND.props, ...props } })
+}
+
+/** 两份文档的回复，服务端已按组排好、编号连续。n 条：a1、b2、a3……交错加入。*/
+function replyGroups(n: number) {
+  const at = (i: number) => new Date(Date.parse('2026-10-11T00:00:00Z') + i * 60_000).toISOString()
+  const a: any[] = []
+  const b: any[] = []
+  for (let i = 1; i <= n; i++) (i % 2 === 1 ? a : b).push({ id: `c_${i}`, no: 0, quote: `原文${i}`, prefix: '', suffix: '', body: `回复${i}`, createdAt: at(i) })
+  const groups = [
+    { doc: 'da', path: '/proj/docs/改名清单.md', kind: 'md', replies: a },
+    { doc: 'db', path: '/tmp/行程.md', kind: 'md', replies: b },
+  ].filter(g => g.replies.length > 0)
+  let no = 0
+  for (const g of groups) for (const r of g.replies) r.no = ++no
+  return groups
+}
+
+/** 去掉指定 ID 的回复（模拟服务端已标为已发送或已删）。*/
+const without = (groups: any[], ids: string[]) =>
+  groups.map(g => ({ ...g, replies: g.replies.filter((r: any) => !ids.includes(r.id)) })).filter(g => g.replies.length > 0)
+const isSent = (f: any) => f.path === '/api/replies/sent'
+const isDeleteComment = (f: any) => f.method === 'DELETE' && f.path.startsWith('/api/comments?')
+const isClearReplies = (f: any) => f.method === 'DELETE' && f.path.startsWith('/api/replies')
+
+/** 唤醒、取一次回复，再在输入框上方画回复区。*/
+async function bandWithReplies($: any, s: any, props: any = {}, extra: any = {}) {
+  await bootAwake($, s)
+  await tick(s.clock)
+  return band($, props, extra)
+}
+
+const labels = async (ui: any) => (await ui.findAll({ type: 'Button' })).map((n: any) => n.props.label)
+/** 列出来的回复行（按画出来的顺序）的 ID。*/
+const rowIds = async (ui: any) =>
+  (await ui.findAll({ type: 'Box' })).map((n: any) => String(n.key ?? '')).filter((k: string) => /^r:[^:]+$/.test(k)).map((k: string) => k.slice(2))
+/** 标题：桌面版是 Box title 里 Svg 的 alt，终端是里面那行 Text（带「↩ 」前缀）。*/
+/** 标题行文字（桌面版、终端都是桌面版的文字：↩、标题、· 文档名），去掉 ↩ 后用空格连起来。*/
+const titleOf = async (ui: any) => {
+  const box = await ui.find({ key: 'title' })
+  return walk(box)
+    .filter((n: any) => n?.type === 'Text')
+    .map((n: any) => allText(n))
+    .filter((t: string) => t !== '↩')
+    .join(' ')
+}
+/** 文档名行（多份文档时每组前一行）：桌面版是 Box doc:<doc> 里 Svg 的 alt，终端是加粗的暗色文字（引擎不保留 Text 的 key，只能按样式认）。*/
+const docRows = async (ui: any) => {
+  const boxes = (await ui.findAll({ type: 'Box' })).filter((n: any) => /^doc:[^:]+$/.test(String(n.key ?? '')))
+  if (boxes.length > 0) return boxes.flatMap((b: any) => svgAlts(b).filter((a: string) => a !== '边框'))
+  return (await ui.findAll({ type: 'Text' })).filter((n: any) => n.props.dimColor && n.props.bold).map((n: any) => n.text)
+}
+/** 按文字找一行 Text。*/
+const textOf = async (ui: any, text: string) => ui.find({ type: 'Text', text })
+/** 子树里所有节点（含自己），按画出来的先后。*/
+const walk = (n: any): any[] => (n ? [n, ...(n.children ?? []).flatMap(walk)] : [])
+/** 回复列表里按 key 取一个原始节点：find 直接返回的节点看不到自己的 hover 字段，要从父节点的 children 里取。*/
+const inList = async (ui: any, key: string) => walk(await ui.find({ key: 'reply-list' })).find(x => x.props?.key === key)
+/** 子树里的 Svg 的 alt 列表。*/
+const svgAlts = (n: any) => walk(n).filter(x => x.type === 'Svg').map(x => x.props.alt)
+/** 只有一份文档（改名清单）的 n 条回复：c_1、c_3、c_5……*/
+const oneDoc = (n: number) => replyGroups(2 * n).filter(g => g.doc === 'da')
+
+test('回复区：2 条回复（单文档）：表格样式的圆角外框、标题行和每条回复各一行（整行一张图）、标题带文档名、× 悬停才出现，下层接在下面；没有回复时整块让给下层', async ($, on) => {
+  const s = stub(on, { replies: oneDoc(2) })
+  const ui = await bandWithReplies($, s)
+  // 圆角外框，边线变暗；第一行是标题行 head，之后每条回复一行
+  const list: any = await ui.find({ key: 'reply-list' })
+  // 桌面版的外框自己画：上沿、下沿是图，不用桌面版的边框
+  expect(list?.props.borderStyle).toBeUndefined()
+  expect(list?.children.map((c: any) => c.props.key).filter((k: string) => k.startsWith('rim:'))).toEqual(['rim:top'])
+  expect(list.children.map((c: any) => c.props.key)).toEqual(['rim:top', 'head', 'gap:head', 'line:r:c_1', 'r:c_1', 'line:r:c_3', 'r:c_3'])
+  // 标题是一张图（alt 带文档名）；只有一份文档，不单列文档名行
+  expect(await titleOf(ui)).toBe('2 条回复 · 改名清单')
+  // 标题行是桌面版的文字（↩、加粗的标题、暗色的 · 文档名），不是图，和右边的按钮对齐
+  expect(svgAlts(await ui.find({ key: 'title' }))).toEqual([])
+  expect(await titleOf(ui)).toBe('2 条回复 · 改名清单')
+  expect(await docRows(ui)).toEqual([])
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_3'])
+  // 每一行是 Box r:<id>:art 包一个 Svg，alt 为「编号 完整原文 回复」
+  expect(svgAlts(await ui.find({ key: 'r:c_1:art' }))).toEqual(['1 原文1 回复1'])
+  expect(svgAlts(await ui.find({ key: 'r:c_3:art' }))).toEqual(['2 原文3 回复3'])
+  // 不再有单独的分界线 Box，也不再有底部「还有 N 条」行
+  // 行与行之间的横线单独一条（line: 开头），每条回复前一条
+  expect((await ui.findAll({ type: 'Box' })).filter((n: any) => String(n.key ?? '').startsWith('line:')).map((n: any) => n.key)).toEqual(['line:r:c_1', 'line:r:c_3'])
+  expect(await ui.find({ key: 'line:more' })).toBeUndefined()
+  expect(await textOf(ui, '还有')).toBeUndefined()
+  // 回复区里每条悬停时底色变浅
+  expect(await inList(ui, 'r:c_1')).toMatchObject({ hover: { backgroundColor: 'rgba(127,127,127,0.10)' } })
+  expect(await inList(ui, 'r:c_3')).toMatchObject({ hover: { backgroundColor: 'rgba(127,127,127,0.10)' } })
+  expect(await ui.find({ key: 'r:c_1:x' })).toMatchObject({ type: 'Button', props: { label: '×', plain: true, dimColor: true } })
+  expect(await ui.find({ key: 'r:c_3:x' })).toMatchObject({ type: 'Button', props: { label: '×', plain: true, dimColor: true } })
+  // 标题行右边：只有〔清空〕〔发送〕（plain，清空变暗），不折叠就没有〔展开〕和竖线
+  expect(await labels(ui)).toEqual(['清空', '发送', '×', '×'])
+  expect(await ui.find({ key: 'clear' })).toMatchObject({ props: { plain: true, dimColor: true } })
+  expect(await ui.find({ key: 'send' })).toMatchObject({ props: { plain: true } })
+  expect(await ui.find({ key: 'toggle' })).toBeUndefined()
+  expect(await ui.find({ key: 'sep' })).toBeUndefined()
+  // 下层的内容接在下面：自己的在上，下层在下
+  expect(await ui.find({ key: 'stack' })).toBeDefined()
+  expect(await ui.find({ key: 'mine' })).toBeDefined()
+  expect(allText(await ui.find({ key: 'rest' }))).toBe('engine')
+  expect(allText(await ui.drawn()).endsWith('engine')).toBe(true)
+  // 上下两层之间隔一小段
+  // 回复区和下层之间不另加空隙：下层（用量带）自己的分隔线上下已经留了空
+  expect((await ui.find({ key: 'stack' }))?.props.rowGap).toBeUndefined()
+  // 引擎节点不能放在设了 width 的 Box 下：包着下层内容的 stack、rest 都不设宽度，靠拉伸铺满
+  for (const key of ['stack', 'rest']) {
+    const box: any = await ui.find({ key })
+    expect(box?.props.width).toBeUndefined()
+    expect(box?.props.alignItems).toBe('stretch')
+  }
+  // 没有回复时整块让给下层
+  s.server.replies = []
+  await tick(s.clock)
+  expect(allText(await ui.drawn())).toBe('engine')
+  expect(await ui.find({ key: 'reply-list' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('回复区：两份文档时标题只写条数，每组前一行文档名（一张图，alt 为文档名）', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(3) })
+  const ui = await bandWithReplies($, s)
+  expect(await titleOf(ui)).toBe('3 条回复')
+  expect(await docRows(ui)).toEqual(['改名清单', '行程'])
+  expect(svgAlts(await ui.find({ key: 'doc:da:art' }))).toEqual(['改名清单'])
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_3', 'c_2'])
+  expect(svgAlts(await ui.find({ key: 'r:c_2:art' }))).toEqual(['3 原文2 回复2'])
+  // 列表里的行顺序：标题行、文档名行、该文档的回复……
+  const list: any = await ui.find({ key: 'reply-list' })
+  expect(list.children.map((c: any) => c.props.key)).toEqual(['rim:top', 'head', 'gap:head', 'line:doc:da', 'doc:da', 'line:r:c_1', 'r:c_1', 'line:r:c_3', 'r:c_3', 'line:doc:db', 'doc:db', 'line:r:c_2', 'r:c_2'])
+  await ui.unmount()
+})
+
+test('回复区：没有待发送的回复时整块让给下层，不画框', async ($, on) => {
+  const s = stub(on, { docs: [summary('plan')] })
+  await boot($)
+  await tick(s.clock)
+  const ui = await band($)
+  expect(allText(await ui.drawn())).toBe('engine')
+  expect(await ui.find({ key: 'reply-list' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('回复区：下层（别的插件）绘制出错时只画回复区，不连累', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(2), innerThrows: true })
+  const ui = await bandWithReplies($, s)
+  expect(await titleOf(ui)).toBe('2 条回复')
+  expect(allText(await ui.drawn())).not.toContain('engine')
+  expect(await ui.find({ key: 'stack' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('回复区：没有回复时直接交给下层，下层出错时错误照样抛出去（不吞）', async ($, on) => {
+  const o: any = { docs: [summary('plan')] }
+  const s = stub(on, o)
+  await boot($)
+  await tick(s.clock)
+  const ui = await band($)
+  expect(allText(await ui.drawn())).toBe('engine')
+  await ui.unmount()
+  o.innerThrows = true
+  await expect(band($)).rejects.toThrow('ui.render')
+})
+
+test('回复区：超过 3 条时折叠，只列最新加入的 3 条，标题行有〔展开其余 1 条 ⌄〕和竖线，按它展开 4 条，〔收起 ⌃〕还原', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(4) })
+  // 行数够（maxRows 40）：下层 1 行，room = 40 - 1 - 3 - 3 = 33
+  const ui = await bandWithReplies($, s, { maxRows: 40 })
+  expect(await titleOf(ui)).toBe('4 条回复')
+  // 最新加入的是 c_2 到 c_4，最早的 c_1 折起来；按文档分组排
+  expect([...(await rowIds(ui))].sort()).toEqual(['c_2', 'c_3', 'c_4'])
+  // 标题行右边依次是〔展开其余 1 条 ⌄〕、竖线、〔清空〕、〔发送〕；没有底部「还有 N 条」行
+  expect(await labels(ui)).toEqual(['展开其余 1 条', '清空', '发送', '×', '×', '×'])
+  expect(await ui.find({ key: 'toggle' })).toMatchObject({ type: 'Button', props: { plain: true, dimColor: true } })
+  expect(svgAlts(await ui.find({ key: 'sep' }))).toEqual(['|'])
+  const head: any = await ui.find({ key: 'head' })
+  expect(head.children.map((c: any) => c.props.key)).toEqual(['head:l', 'title', 'toggle', 'sep', 'clear', 'send', 'head:r'])
+  expect(await ui.find({ key: 'line:more' })).toBeUndefined()
+  expect(await textOf(ui, '还有')).toBeUndefined()
+  await ui.press({ key: 'toggle' })
+  expect([...(await rowIds(ui))].sort()).toEqual(['c_1', 'c_2', 'c_3', 'c_4'])
+  expect((await labels(ui)).slice(0, 3)).toEqual(['收起', '清空', '发送'])
+  await ui.press({ key: 'toggle' })
+  expect([...(await rowIds(ui))].sort()).toEqual(['c_2', 'c_3', 'c_4'])
+  expect((await labels(ui))[0]).toBe('展开其余 1 条')
+  // 少到 3 条：不用折叠，〔展开〕和竖线没有了；展开状态也作废，再多起来时仍是折叠的
+  await ui.press({ key: 'toggle' })
+  s.server.replies = replyGroups(3)
+  await tick(s.clock)
+  expect(await ui.find({ key: 'toggle' })).toBeUndefined()
+  expect(await ui.find({ key: 'sep' })).toBeUndefined()
+  expect(await rowIds(ui)).toHaveLength(3)
+  s.server.replies = replyGroups(4)
+  await tick(s.clock)
+  expect([...(await rowIds(ui))].sort()).toEqual(['c_2', 'c_3', 'c_4'])
+  expect((await labels(ui))[0]).toBe('展开其余 1 条')
+  await ui.unmount()
+})
+
+test('回复区：终端里折叠时〔展开其余 N 条〕后面没有竖线图', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(5) })
+  const ui = await bandWithReplies($, s, { maxRows: 40 }, { surface: 'terminal' })
+  expect(await labels(ui)).toEqual(['展开其余 2 条', '清空', '发送', '×', '×', '×'])
+  expect(await ui.find({ key: 'sep' })).toBeUndefined()
+  const head: any = await ui.find({ key: 'head' })
+  expect(head.children.map((c: any) => c.props.key)).toEqual(['title', 'toggle', 'clear', 'send'])
+  await ui.unmount()
+})
+
+test('回复区：行数不够（maxRows 小）时只列 room 条（至少 1 条）；展开也放不下更多时不给〔展开〕', async ($, on) => {
+  // maxRows 10、下层 engine 占 1 行：room = 10 - 1 - 3 - 3 = 3，和折叠时一样多，所以没有〔展开〕
+  const s = stub(on, { replies: replyGroups(5) })
+  let ui = await bandWithReplies($, s, { maxRows: 10 })
+  expect([...(await rowIds(ui))].sort()).toEqual(['c_3', 'c_4', 'c_5'])
+  expect(await ui.find({ key: 'toggle' })).toBeUndefined()
+  expect((await labels(ui))[0]).toBe('清空')
+  await ui.unmount()
+  // maxRows 再小：room 只剩 1（或更少）也至少列 1 条，最新加入的那条
+  ui = await band($, { maxRows: 8 })
+  expect(await rowIds(ui)).toEqual(['c_5'])
+  expect(await ui.find({ key: 'toggle' })).toBeUndefined()
+  await ui.unmount()
+  ui = await band($, { maxRows: 2 })
+  expect(await rowIds(ui)).toEqual(['c_5'])
+  await ui.unmount()
+})
+
+test('回复区：下层内容越高，回复区列的条数越少（room 随下层行数减少）', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(5) })
+  await bootAwake($, s)
+  await tick(s.clock)
+  // 下层 engine 是 1 行：room = 40 - 1 - 3 - 3，折叠时列 3 条
+  let ui = await band($, { maxRows: 40 })
+  expect(await rowIds(ui)).toHaveLength(3)
+  await ui.unmount()
+  // maxRows 9：room = 2
+  ui = await band($, { maxRows: 9 })
+  expect(await rowIds(ui)).toHaveLength(2)
+  await ui.unmount()
+})
+
+test('回复区：× 删掉一条：DELETE 对应的评论，这一行马上消失；删失败时保留并提示原因', async ($, on) => {
+  const o: any = { replies: replyGroups(2) }
+  const s = stub(on, o)
+  const ui = await bandWithReplies($, s)
+  o.deleteFails = true
+  await ui.press({ key: 'r:c_2:x' })
+  await s.clock.settle()
+  expect(s.toasts.at(-1)).toContain('没删掉：')
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
+  o.deleteFails = false
+  await ui.press({ key: 'r:c_2:x' })
+  await s.clock.settle()
+  expect(s.fetched.filter(isDeleteComment).at(-1)?.path).toBe('/api/comments?doc=db&id=c_2')
+  expect(await rowIds(ui)).toEqual(['c_1'])
+  expect(await titleOf(ui)).toBe('1 条回复 · 改名清单')
+  // 刚删的不会在下一次取数时又冒出来
+  await ticks(s.clock, 2)
+  expect(await rowIds(ui)).toEqual(['c_1'])
+  // 删到只剩一条再删：回复区让给下层
+  await ui.press({ key: 'r:c_1:x' })
+  await s.clock.settle()
+  expect(allText(await ui.drawn())).toBe('engine')
+  await ui.unmount()
+})
+
+test('回复区：〔清空〕点一次只变「确认清空」，3 秒后复原；3 秒内再点才清空本会话的回复', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(2) })
+  const ui = await bandWithReplies($, s)
+  expect((await labels(ui))[0]).toBe('清空')
+  await ui.press({ key: 'clear' })
+  await s.clock.settle()
+  expect((await labels(ui))[0]).toBe('确认清空')
+  expect(s.fetched.some(isClearReplies)).toBe(false)
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
+  // 3 秒内没再点：复原
+  await ticks(s.clock, 3)
+  expect((await labels(ui))[0]).toBe('清空')
+  expect(s.fetched.some(isClearReplies)).toBe(false)
+  // 点两次（间隔 1.5 秒）：清空
+  await ui.press({ key: 'clear' })
+  await s.clock.settle()
+  await s.clock.advance(1500)
+  await ui.press({ key: 'clear' })
+  await s.clock.settle()
+  expect(s.fetched.filter(isClearReplies).map(f => f.path)).toEqual(['/api/replies?session=sess-1'])
+  expect(s.server.replies).toEqual([])
+  expect(allText(await ui.drawn())).toBe('engine')
+  await ui.unmount()
+})
+
+test('回复区：〔清空〕第二次点得太晚（超过 3 秒）算第一次，不清空', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(2) })
+  const ui = await bandWithReplies($, s)
+  await ui.press({ key: 'clear' })
+  await s.clock.settle()
+  await s.clock.advance(3500)
+  await ui.press({ key: 'clear' })
+  await s.clock.settle()
+  expect(s.fetched.some(isClearReplies)).toBe(false)
+  expect((await labels(ui))[0]).toBe('确认清空')
+  await ui.unmount()
+})
+
+test('回复区：〔发送〕以你的名义发出回复块，标为已发送，提示「已发给 Claude」，回复区让位', async ($, on) => {
+  const groups = replyGroups(2)
+  const s = stub(on, { replies: groups })
+  const ui = await bandWithReplies($, s)
+  await ui.press({ key: 'send' })
+  await s.clock.settle()
+  expect(s.submitted).toEqual([withReplies('', groups, 'zh', '/proj')])
+  expect(s.submitted[0].startsWith('[文档回复] 请按编号逐条答复。\n改名清单.md（docs/改名清单.md）\n')).toBe(true)
+  expect(s.fetched.filter(isSent).map(f => f.body)).toEqual([{ ids: ['c_1', 'c_2'] }])
+  expect(s.toasts).toContain('已发给 Claude')
+  expect(allText(await ui.drawn())).toBe('engine')
+  await ui.unmount()
+})
+
+test('回复区：〔发送〕失败：回复全部保留，不标已发送，提示带原因，按钮恢复', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(2), dropSubmit: true })
+  const ui = await bandWithReplies($, s)
+  await ui.press({ key: 'send' })
+  await s.clock.settle()
+  expect(s.fetched.some(isSent)).toBe(false)
+  expect(s.toasts.at(-1)).toBe('没发出去：会话不接受')
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
+  expect((await labels(ui))[1]).toBe('发送')
+  // 保留的回复可以再发
+  await ui.press({ key: 'send' })
+  await s.clock.settle()
+  expect(s.submitted.length).toBe(2)
+  await ui.unmount()
+})
+
+test('回复区：〔发送〕发送中显示「发送中…」，再点无效，只发一次', async ($, on) => {
+  let release: () => void = () => {}
+  const gate = new Promise<void>(r => (release = r))
+  const s = stub(on, { replies: replyGroups(2), pluginGate: gate })
+  const ui = await bandWithReplies($, s)
+  const first = ui.press({ key: 'send' })
+  await s.clock.settle()
+  expect((await labels(ui))[1]).toBe('发送中…')
+  await ui.press({ key: 'send' })
+  await s.clock.settle()
+  release()
+  await first
+  await s.clock.settle()
+  expect(s.submitted.length).toBe(1)
+  expect(s.fetched.filter(isSent).length).toBe(1)
+  await ui.unmount()
+})
+
+test('〔发送〕正在发时用户按回车：这条消息不再带上同一批回复，也不重复标记', async ($, on) => {
+  let release: () => void = () => {}
+  const gate = new Promise<void>(r => (release = r))
+  const s = stub(on, { replies: replyGroups(2), pluginGate: gate })
+  const ui = await bandWithReplies($, s)
+  const sending = ui.press({ key: 'send' })
+  await s.clock.settle()
+  await userSays($, '顺便问一句')
+  expect(s.prompts.at(-1)?.text).toBe('顺便问一句')
+  release()
+  await sending
+  await s.clock.settle()
+  expect(s.submitted.length).toBe(1)
+  expect(s.fetched.filter(isSent).length).toBe(1)
+  await ui.unmount()
+})
+
+test('回车发送：你的话在前，回复块在后；交出去后标为已发送，回复区让位，不弹提示', async ($, on) => {
+  const groups = replyGroups(2)
+  const s = stub(on, { replies: groups })
+  const ui = await bandWithReplies($, s)
+  await userSays($, '这两处改一下')
+  await s.clock.settle()
+  expect(s.prompts.at(-1)?.text).toBe(withReplies('这两处改一下', groups, 'zh', '/proj'))
+  expect(s.prompts.at(-1)?.text.startsWith('这两处改一下\n\n[文档回复] 请按编号逐条答复。\n')).toBe(true)
+  expect(s.fetched.filter(isSent).map(f => f.body)).toEqual([{ ids: ['c_1', 'c_2'] }])
+  expect(s.toasts).not.toContain('已发给 Claude')
+  expect(allText(await ui.drawn())).toBe('engine')
+  // 已发出的不会再带第二遍
+  await ticks(s.clock, 2)
+  await userSays($, '再说一句')
+  expect(s.prompts.at(-1)?.text).toBe('再说一句')
+  expect(s.fetched.filter(isSent).length).toBe(1)
+  await ui.unmount()
+})
+
+test('回车发送：bridge、sdk 来源也算用户自己发的', async ($, on) => {
+  const groups = replyGroups(1)
+  const s = stub(on, { replies: groups })
+  await bootAwake($, s)
+  await tick(s.clock)
+  await userSays($, '好', 'bridge')
+  expect(s.prompts.at(-1)?.text).toBe(withReplies('好', groups, 'zh', '/proj'))
+  s.server.replies = groups
+  await ticks(s.clock, 2)
+  await userSays($, '行', 'sdk')
+  expect(s.prompts.at(-1)?.text).toBe(withReplies('行', groups, 'zh', '/proj'))
+  expect(s.fetched.filter(isSent).length).toBe(2)
+})
+
+test('回车发送：插件、通知发的消息和斜杠命令原样放行，不标记；没有回复时原样放行', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(2) })
+  const ui = await bandWithReplies($, s)
+  await $.prompt.submit({ text: '别的插件', wait: false, origin: { kind: 'plugin', name: 'other' } })
+  await $.prompt.submit({ text: '后台任务完成', wait: false, origin: { kind: 'task-notification' } })
+  await userSays($, '/help')
+  await userSays($, '  /clear')
+  expect(s.prompts.map(p => p.text)).toEqual(['别的插件', '后台任务完成', '/help', '  /clear'])
+  expect(s.fetched.some(isSent)).toBe(false)
+  // 这些回复还在，回复区照旧
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
+  // 用户自己发时才带上
+  await userSays($, '好')
+  await s.clock.settle()
+  expect(s.prompts.at(-1)?.text.startsWith('好\n\n[文档回复]')).toBe(true)
+  expect(s.fetched.filter(isSent).map(f => f.body)).toEqual([{ ids: ['c_1', 'c_2'] }])
+  // 回复已经发完，没有回复了：原样放行
+  await tick(s.clock)
+  await userSays($, '第三条')
+  expect(s.prompts.at(-1)?.text).toBe('第三条')
+  expect(s.fetched.filter(isSent).length).toBe(1)
+  await ui.unmount()
+})
+
+test('回车发送：消息被拒时不标已发送，回复照旧留着，下一次发送再带', async ($, on) => {
+  const o: any = { replies: replyGroups(2) }
+  const s = stub(on, o)
+  const ui = await bandWithReplies($, s)
+  o.refuseUserPrompts = 1
+  const r: any = await userSays($, '第一条')
+  expect(r.drop).toBe('拒绝')
+  await s.clock.settle()
+  expect(s.fetched.some(isSent)).toBe(false)
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
+  await userSays($, '第二条')
+  await s.clock.settle()
+  expect(s.prompts.at(-1)?.text.startsWith('第二条\n\n[文档回复]')).toBe(true)
+  expect(s.fetched.filter(isSent).map(f => f.body)).toEqual([{ ids: ['c_1', 'c_2'] }])
+  expect(allText(await ui.drawn())).toBe('engine')
+  await ui.unmount()
+})
+
+test('回车发送：标记失败（服务中途不在）不影响已发出的消息，回复区照样收起，并提示一次别再发', async ($, on) => {
+  const o: any = { replies: replyGroups(1) }
+  const s = stub(on, o)
+  const ui = await bandWithReplies($, s)
+  o.alive = false
+  await userSays($, '好')
+  await s.clock.settle()
+  expect(s.prompts.at(-1)?.text.startsWith('好\n\n[文档回复]')).toBe(true)
+  expect(allText(await ui.drawn())).toBe('engine')
+  expect(s.toasts).toEqual(['已发出，但没能标为已发送（文档服务没在运行），这些回复还会留在列表里，别再发一遍'])
+  await ui.unmount()
+})
+
+test('回复区：服务不在时 × 和〔确认清空〕不假装成功：回复留着，提示原因', async ($, on) => {
+  const o: any = { replies: replyGroups(2) }
+  const s = stub(on, o)
+  const ui = await bandWithReplies($, s)
+  o.alive = false
+  const before = await rowIds(ui)
+  await ui.press({ key: `r:${before[0]}:x` })
+  await s.clock.settle()
+  expect(s.toasts.at(-1)).toBe('没删掉：文档服务没在运行')
+  expect(await rowIds(ui)).toEqual(before)
+  await ui.press({ key: 'clear' })
+  await s.clock.settle()
+  await ui.press({ key: 'clear' })
+  await s.clock.settle()
+  expect(s.toasts.at(-1)).toBe('没删掉：文档服务没在运行')
+  expect(await rowIds(ui)).toEqual(before)
+  await ui.unmount()
+})
+
+test('回复区：英文界面：标题、按钮和回复块用英文', async ($, on) => {
+  const groups = oneDoc(1)
+  const s = stub(on, { replies: groups, language: 'English' })
+  const ui = await bandWithReplies($, s)
+  expect(await titleOf(ui)).toBe('1 replies · 改名清单')
+  expect((await labels(ui)).slice(0, 2)).toEqual(['Clear', 'Send'])
+  await ui.press({ key: 'clear' })
+  await s.clock.settle()
+  expect((await labels(ui))[0]).toBe('Confirm clear')
+  await userSays($, 'fix')
+  expect(s.prompts.at(-1)?.text).toBe(withReplies('fix', groups, 'en', '/proj'))
+  expect(s.prompts.at(-1)?.text.startsWith('fix\n\n[Doc reply] Please answer each by number.')).toBe(true)
+  await ui.unmount()
+})
+
+test('回复区：英文界面：〔展开其余 N 条〕、〔收起〕和〔发送〕成功的提示用英文', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(4), language: 'English' })
+  const ui = await bandWithReplies($, s, { maxRows: 40 })
+  expect(await titleOf(ui)).toBe('4 replies')
+  expect((await labels(ui))[0]).toBe('Show 1 more')
+  await ui.press({ key: 'toggle' })
+  expect((await labels(ui))[0]).toBe('Collapse')
+  await ui.press({ key: 'toggle' })
+  await ui.press({ key: 'send' })
+  await s.clock.settle()
+  expect(s.toasts).toContain('Sent to Claude')
+  await ui.unmount()
+})
+
+test('回复区：有调查问卷时让位', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(2) })
+  const ui = await bandWithReplies($, s, { hasSurvey: true })
+  expect(allText(await ui.drawn())).toBe('engine')
+  expect(await ui.find({ key: 'reply-list' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('回复区：服务一时不在时保留现有回复，不去启动服务；服务回来后接着更新', async ($, on) => {
+  const o: any = { replies: replyGroups(2) }
+  const s = stub(on, o)
+  const ui = await bandWithReplies($, s)
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
+  o.alive = false
+  await ticks(s.clock, 2)
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
+  expect(s.spawned.length).toBe(0)
+  o.alive = true
+  s.server.replies = replyGroups(3)
+  await tick(s.clock)
+  expect(await titleOf(ui)).toBe('3 条回复')
+  await ui.unmount()
+})
+
+test('回复区：取回复一时失败（服务应答出错）：保留现有回复，不闪一下', async ($, on) => {
+  const o: any = { replies: replyGroups(2) }
+  const s = stub(on, o)
+  const ui = await bandWithReplies($, s)
+  o.repliesFail = true
+  await ticks(s.clock, 2)
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
+  expect(s.toasts).toEqual([])
+  o.repliesFail = false
+  s.server.replies = replyGroups(1)
+  await tick(s.clock)
+  expect(await rowIds(ui)).toEqual(['c_1'])
+  await ui.unmount()
+})
+
+test('回复区：× 平时不显示，鼠标停在那一条上才出现；终端画成文字的同样的列表', async ($, on) => {
+  const groups = oneDoc(2)
+  groups[0].replies[0].quote = '很长的原文'.repeat(20)
+  const s = stub(on, { replies: groups })
+  const ui = await bandWithReplies($, s)
+  // × 排在行尾，那一格和行一样高，最底下一像素是图（最后一行画外框下沿）；平时 display none，悬停时 flex；它自己不带 key（带 key 会挡住上层的悬停）
+  for (const id of ['c_1', 'c_3']) {
+    const row = await ui.find({ key: `r:${id}` })
+    expect(row.props.alignItems).toBe('stretch')
+    // 行尾空白（PAD 宽），× 那一格出现在它和右边框之间
+    expect(row.children.at(-3).children[0]).toMatchObject({ type: 'Svg', props: { width: 8, height: 28 } })
+    const reveal = row.children.at(-2)
+    expect(reveal).toMatchObject({ type: 'Box', props: { display: 'none', flexDirection: 'column' }, hover: { display: 'flex' } })
+    expect(reveal.children[1]).toMatchObject({ type: 'Svg', props: { width: 28, height: 1 } })
+    expect(reveal.children[1].props.source.includes('<rect')).toBe(id === 'c_3')
+    expect(reveal.props.key).toBeUndefined()
+    expect(reveal.children[0].children[0]).toMatchObject({ type: 'Button', props: { key: `r:${id}:x`, label: '×' } })
+  }
+  expect(await ui.find({ key: 'r:c_1:x' })).toMatchObject({ props: { plain: true, dimColor: true } })
+  // 桌面版：完整原文放在图的 alt 里（图里只画截短的）
+  expect(svgAlts(await ui.find({ key: 'r:c_1:art' }))).toEqual([`1 ${'很长的原文'.repeat(20)} 回复1`])
+  await ui.unmount()
+  const term = await band($, {}, { surface: 'terminal' })
+  expect(await titleOf(term)).toBe('2 条回复 · 改名清单')
+  expect(await rowIds(term)).toEqual(['c_1', 'c_3'])
+  // 终端没有图：编号是橙色文字，原文前有暗色「│ 」，回复是普通文字
+  expect(walk(await term.find({ key: 'reply-list' })).filter(x => x.type === 'Svg')).toHaveLength(0)
+  expect(walk(await term.find({ key: 'r:c_1:no' })).find(x => x.type === 'Text')).toMatchObject({ children: ['1'], props: { color: 'claude' } })
+  expect((await term.find({ key: 'r:c_3:no' }))?.text).toBe('2')
+  expect((await term.find({ key: 'r:c_1:q' }))?.text.startsWith('│ ')).toBe(true)
+  expect(walk(await term.find({ key: 'r:c_1:q' })).find(x => x.type === 'Text')).toMatchObject({ props: { dimColor: true } })
+  expect((await term.find({ key: 'r:c_1:b' }))?.text).toBe('回复1')
+  expect(await labels(term)).toEqual(['清空', '发送', '×', '×'])
+  // 终端里一样能按〔发送〕
+  await term.press({ key: 'send' })
+  await s.clock.settle()
+  expect(s.submitted.length).toBe(1)
+  expect(s.toasts).toContain('已发给 Claude')
+  await term.unmount()
+})
+
+test('回复区：文档页上新加回复后，已画出的回复区随之更新，不弹提示', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(1) })
+  const ui = await bandWithReplies($, s)
+  expect(await titleOf(ui)).toBe('1 条回复 · 改名清单')
+  s.server.replies = replyGroups(2)
+  await tick(s.clock)
+  expect(await titleOf(ui)).toBe('2 条回复')
+  expect(await rowIds(ui)).toEqual(['c_1', 'c_2'])
+  expect(s.toasts).toEqual([])
+  await ui.unmount()
+})
+
+// ---- 聊天记录里的回复消息 ----
+
+const MESSAGE = {
+  plugin: 'cc-doc-review',
+  component: 'UserMessage',
+  surface: 'desktop',
+  viewport: { columns: 120, rows: 40 },
+} as const
+
+async function message($: any, text: string, extra: any = {}) {
+  return $.ui.mount({ ...MESSAGE, ...extra, props: { text, isExpanded: true, origin: { kind: 'composer' }, ...(extra.props ?? {}) } })
+}
+
+test('聊天记录：回复消息画成同样的圆角列表（reply-msg 里包 reply-list），你写的话在下面，原始格式文字不出现', async ($, on) => {
+  stub(on)
+  await boot($)
+  const ui = await message($, withReplies('这几处改一下', replyGroups(3), 'zh', '/proj'))
+  expect(await ui.find({ key: 'reply-msg' })).toBeDefined()
+  expect((await ui.find({ key: 'reply-list' }))?.props.borderStyle).toBeUndefined()
+  expect(await ui.find({ key: 'rim:top' })).toBeDefined()
+  expect(await ui.find({ key: 'rim:bottom' })).toBeUndefined()
+  // 右边框每行都宽 RADIUS（× 那一格各行对齐）：最后一行带右下圆角，中间的行竖线贴右边
+  expect((await ui.find({ key: 'r:n3:r' }))?.children[0].props.width).toBe(6)
+  expect((await ui.find({ key: 'r:n2:r' }))?.children[0].props.width).toBe(6)
+  expect((await ui.find({ key: 'r:n2:r' }))?.children[0].props.source).toContain('<rect x="5" y="0" width="1" height="28" class="edge"/>')
+  expect(await titleOf(ui)).toBe('3 条回复')
+  expect(await docRows(ui)).toEqual(['改名清单', '行程'])
+  expect(await rowIds(ui)).toEqual(['n1', 'n2', 'n3'])
+  expect(svgAlts(await ui.find({ key: 'r:n1:art' }))).toEqual(['1 原文1 回复1'])
+  // 编号按文档分组后的顺序：改名清单的两条是 1、2，行程的是 3
+  expect(svgAlts(await ui.find({ key: 'r:n2:art' }))).toEqual(['2 原文3 回复3'])
+  expect(svgAlts(await ui.find({ key: 'r:n3:art' }))).toEqual(['3 原文2 回复2'])
+  // 聊天记录里不折叠：reply-msg 里包 reply-list，列表里是标题行、文档名行和每条回复
+  const list: any = await ui.find({ key: 'reply-list' })
+  expect(list.children.map((c: any) => c.props.key)).toEqual(['rim:top', 'head', 'gap:head', 'line:doc:0', 'doc:0', 'line:r:n1', 'r:n1', 'line:r:n2', 'r:n2', 'line:doc:1', 'doc:1', 'line:r:n3', 'r:n3'])
+  // 聊天记录里的列表没有按钮、没有 ×
+  expect(await labels(ui)).toEqual([])
+  expect((await ui.findAll({ type: 'Box' })).filter((n: any) => n.props.display === 'none')).toHaveLength(0)
+  // 也没有悬停变色
+  expect((await inList(ui, 'r:n1')).hover).toBeUndefined()
+  expect(walk(await ui.find({ key: 'reply-list' })).filter(n => n.hover !== undefined)).toHaveLength(0)
+  expect(await textOf(ui, '这几处改一下')).toBeDefined()
+  const drawn = allText(await ui.drawn())
+  expect(drawn).not.toContain('<!-- reply')
+  expect(drawn).not.toContain('[文档回复]')
+  await ui.unmount()
+})
+
+test('聊天记录：只有一份文档时标题带文档名；只有回复块（点〔发送〕发的）时不画你写的话', async ($, on) => {
+  stub(on)
+  await boot($)
+  const ui = await message($, withReplies('', oneDoc(1), 'zh', '/proj'))
+  expect(await titleOf(ui)).toBe('1 条回复 · 改名清单')
+  expect(await docRows(ui)).toEqual([])
+  expect(allText(await ui.find({ key: 'reply-msg' }))).not.toContain('好')
+  await ui.unmount()
+})
+
+test('聊天记录：6 条回复不折叠，全部列出', async ($, on) => {
+  stub(on)
+  await boot($)
+  const ui = await message($, withReplies('好', replyGroups(6), 'zh', '/proj'))
+  expect(await rowIds(ui)).toHaveLength(6)
+  expect(await textOf(ui, '还有')).toBeUndefined()
+  await ui.unmount()
+})
+
+test('聊天记录：折叠视图（isExpanded 为 false）是一行「N 条回复 · 你写的话的开头」；没写话时只有标题；英文消息用英文', async ($, on) => {
+  stub(on)
+  await boot($)
+  let ui = await message($, withReplies('这几处改一下\n第二行', replyGroups(3), 'zh', '/proj'), { props: { isExpanded: false } })
+  expect(allText(await ui.drawn())).toBe('3 条回复 · 这几处改一下')
+  expect(await ui.find({ key: 'reply-list' })).toBeUndefined()
+  await ui.unmount()
+  ui = await message($, withReplies('', replyGroups(2), 'en', '/proj'), { props: { isExpanded: false } })
+  expect(allText(await ui.drawn())).toBe('2 replies')
+  await ui.unmount()
+  ui = await message($, withReplies('fix it', oneDoc(1), 'en', '/proj'))
+  expect(await titleOf(ui)).toBe('1 replies · 改名清单')
+  await ui.unmount()
+})
+
+test('聊天记录：认不出的消息（普通消息、被改乱的回复块）交给下层', async ($, on) => {
+  stub(on)
+  await boot($)
+  let ui = await message($, '随便说一句')
+  expect(allText(await ui.drawn())).toBe('engine')
+  await ui.unmount()
+  const broken = withReplies('看看', replyGroups(2), 'zh', '/proj').replace('<!-- reply 2 -->', '<!-- reply 9 -->')
+  ui = await message($, broken)
+  expect(allText(await ui.drawn())).toBe('engine')
+  await ui.unmount()
+  ui = await message($, '▎ 自己打的\n  不是回复', { props: { isExpanded: false } })
+  expect(allText(await ui.drawn())).toBe('engine')
+  await ui.unmount()
+})
+
+test('聊天记录：不需要唤醒；终端里画同样的列表', async ($, on) => {
+  const s = stub(on)
+  await boot($)
+  await s.clock.settle()
+  const calls = s.ext.calls
+  const ui = await message($, withReplies('好', replyGroups(2), 'zh', '/proj'), { surface: 'terminal' })
+  expect(await titleOf(ui)).toBe('2 条回复')
+  expect(await rowIds(ui)).toEqual(['n1', 'n2'])
+  // 终端没有图：编号、「│ 原文」、回复都是文字
+  expect(walk(await ui.find({ key: 'reply-list' })).filter(x => x.type === 'Svg')).toHaveLength(0)
+  expect((await ui.find({ key: 'r:n1:no' }))?.text).toBe('1')
+  expect((await ui.find({ key: 'r:n1:q' }))?.text).toBe('│ 原文1')
+  expect((await ui.find({ key: 'r:n1:b' }))?.text).toBe('回复1')
+  expect(await textOf(ui, '好')).toBeDefined()
+  expect(s.ext.calls).toBe(calls)
+  await ui.unmount()
+})
+
+test('聊天记录：回车发出的消息（你的话 + 回复块）在聊天记录里认得出', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(3) })
+  await bootAwake($, s)
+  await tick(s.clock)
+  await userSays($, '这几处改一下')
+  await s.clock.settle()
+  const ui = await message($, s.prompts.at(-1)!.text)
+  expect(await titleOf(ui)).toBe('3 条回复')
+  expect(await rowIds(ui)).toEqual(['n1', 'n2', 'n3'])
+  expect(await textOf(ui, '这几处改一下')).toBeDefined()
+  await ui.unmount()
+})
+
+test('聊天记录：桌面版显示的是你打的原文（不带回复块）时，按发送时记下的完整消息画回复卡片', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(3) })
+  await bootAwake($, s)
+  await tick(s.clock)
+  await userSays($, '  这几处改一下 ')
+  await s.clock.settle()
+  const ui = await message($, '这几处改一下')
+  expect(await titleOf(ui)).toBe('3 条回复')
+  expect(await rowIds(ui)).toEqual(['n1', 'n2', 'n3'])
+  expect(await textOf(ui, '这几处改一下')).toBeDefined()
+  await ui.unmount()
+  // 没带过回复的普通消息照旧交给下层
+  const plain = await message($, '随便说一句')
+  expect(await plain.find({ key: 'reply-msg' })).toBeUndefined()
+  await plain.unmount()
+})
+
+test('回复区：桌面版每行的回复用桌面版文字（按行宽截断加「…」），底下垫一像素的图；最后一行画外框下沿', async ($, on) => {
+  const s = stub(on, { replies: [{ doc: 'd1', path: '/proj/docs/改名清单.md', replies: [{ id: 'c_1', no: 1, quote: '原文', body: '第一行\n第二行', createdAt: '2026-10-19T00:00:00Z' }, { id: 'c_2', no: 2, quote: '原文2', body: '好', createdAt: '2026-10-19T00:01:00Z' }] }] })
+  const ui = await bandWithReplies($, s)
+  const body = await ui.find({ key: 'r:c_1:b' })
+  expect(body.props).toMatchObject({ flexGrow: 1, flexDirection: 'column' })
+  // 上下居中、靠左（× 出现时文字不动）
+  expect(body.children[0].props).toMatchObject({ flexDirection: 'column', justifyContent: 'center', alignItems: 'flex-start' })
+  expect(body.children[0].children[0]).toMatchObject({ type: 'Text', props: { bold: true, wrap: 'truncate-end' } })
+  expect(body.children[0].children[0].children).toEqual(['第一行 第二行'])
+  expect(body.children[1].children[0].props.source.includes('<rect')).toBe(false)
+  expect((await ui.find({ key: 'r:c_2:b' })).children[1].children[0].props.source.includes('<rect')).toBe(true)
+  await ui.unmount()
+})
+
+test('聊天记录：桌面版在按回车那一刻就画了这条消息（还没记下完整内容），记下后重画成回复卡片', async ($, on) => {
+  const s = stub(on, { replies: replyGroups(2) })
+  await bootAwake($, s)
+  await tick(s.clock)
+  const ui = await message($, '这两处帮我看看')
+  expect(await ui.find({ key: 'reply-msg' })).toBeUndefined()
+  await userSays($, '这两处帮我看看')
+  await s.clock.settle()
+  expect(await titleOf(ui)).toBe('2 条回复')
+  await ui.unmount()
 })

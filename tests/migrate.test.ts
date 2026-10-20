@@ -46,7 +46,7 @@ test('从旧 server.json 取进程号：必须是大于 1 的整数', async () =
   expect(legacyServerPid('坏的')).toBeUndefined()
 })
 
-test('结束进程前核对命令行，确认它是旧版评审服务', async () => {
+test('结束进程前核对命令行，确认它是旧版文档服务', async () => {
   expect(psArgv(4242)).toEqual(['ps', '-p', '4242', '-o', 'command='])
   expect(killArgv(4242)).toEqual(['kill', '4242'])
   expect(isLegacyCommand('/x/doc-review/bin/doc-review-server -dir /y\n')).toBe(true)

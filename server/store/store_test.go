@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,10 +73,6 @@ func TestCommentEditableOnlyAsDraft(t *testing.T) {
 	if c.Status != Draft || !strings.HasPrefix(c.ID, "c_") {
 		t.Fatalf("bad comment: %+v", c)
 	}
-	up, err := s.UpdateComment(d.ID, c.ID, "再展开一点")
-	if err != nil || up.Body != "再展开一点" {
-		t.Fatalf("update: %+v %v", up, err)
-	}
 	if err := s.DeleteComment(d.ID, c.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +83,7 @@ func TestCommentEditableOnlyAsDraft(t *testing.T) {
 	if _, err := s.AddComment(d.ID, NewComment{Quote: " ", Body: "x"}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("空引用应拒绝，得到 %v", err)
 	}
-	if _, err := s.UpdateComment(d.ID, "c_nope", "x"); !errors.Is(err, ErrNotFound) {
+	if err := s.DeleteComment(d.ID, "c_nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("got %v", err)
 	}
 }
@@ -98,147 +95,9 @@ func TestGetUnknownDoc(t *testing.T) {
 	}
 }
 
-func TestSendLocksDraftsAndWritesOutbox(t *testing.T) {
-	s, p := newStore(t)
-	d, _ := s.Open(p, "s1")
-	c, _ := s.AddComment(d.ID, NewComment{Quote: "正文", Body: "改"})
-	b, err := s.Send(d.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(b.Batch, "b_") || b.Path != p || len(b.Comments) != 1 || b.Comments[0].Body != "改" {
-		t.Fatalf("bad batch: %+v", b)
-	}
-	if _, err := s.UpdateComment(d.ID, c.ID, "x"); !errors.Is(err, ErrNotDraft) {
-		t.Fatalf("已发送的评论应锁定，得到 %v", err)
-	}
-	if err := s.DeleteComment(d.ID, c.ID); !errors.Is(err, ErrNotDraft) {
-		t.Fatalf("got %v", err)
-	}
-	if _, err := s.Send(d.ID); !errors.Is(err, ErrNoDrafts) {
-		t.Fatalf("没有草稿时应返回 ErrNoDrafts，得到 %v", err)
-	}
-	got, _ := s.Get(d.ID)
-	if got.Comments[0].Status != Sent || got.Comments[0].Batch != b.Batch || got.Comments[0].SentAt == nil {
-		t.Fatalf("bad comment after send: %+v", got.Comments[0])
-	}
-}
-
-func TestOutboxIsPerSessionAndAckRemoves(t *testing.T) {
-	s, p := newStore(t)
-	d, _ := s.Open(p, "s1")
-	s.AddComment(d.ID, NewComment{Quote: "正文", Body: "改"})
-	b, _ := s.Send(d.ID)
-	got, err := s.Outbox("s1")
-	if err != nil || len(got) != 1 || got[0].Batch != b.Batch {
-		t.Fatalf("outbox: %+v %v", got, err)
-	}
-	if other, _ := s.Outbox("s2"); len(other) != 0 {
-		t.Fatalf("别的会话不应看到：%+v", other)
-	}
-	if err := s.Ack("s1", b.Batch); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := s.Outbox("s1"); len(got) != 0 {
-		t.Fatalf("ack 后应为空：%+v", got)
-	}
-	if err := s.Ack("s1", "../../etc"); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("非法批次名应拒绝，得到 %v", err)
-	}
-	if err := s.Ack("s1", b.Batch); err != nil {
-		t.Fatalf("重复 ack 应幂等，得到 %v", err)
-	}
-}
-
-func TestResolveAcrossDocs(t *testing.T) {
-	s, p := newStore(t)
-	p2 := filepath.Join(filepath.Dir(p), "b.html")
-	os.WriteFile(p2, []byte("<p>x</p>"), 0o644)
-	d1, _ := s.Open(p, "s1")
-	d2, _ := s.Open(p2, "s1")
-	c1, _ := s.AddComment(d1.ID, NewComment{Quote: "正文", Body: "a"})
-	c2, _ := s.AddComment(d2.ID, NewComment{Quote: "x", Body: "b"})
-	s.Send(d1.ID)
-	s.Send(d2.ID)
-	n, missing, err := s.Resolve([]ResolveItem{{ID: c1.ID, Note: "已改成表格"}, {ID: c2.ID, Note: "没改：原因……"}})
-	if err != nil || n != 2 || len(missing) != 0 {
-		t.Fatalf("resolve: %d %v %v", n, missing, err)
-	}
-	g1, _ := s.Get(d1.ID)
-	if g1.Comments[0].Status != Resolved || g1.Comments[0].Resolution.Note != "已改成表格" {
-		t.Fatalf("bad: %+v", g1.Comments[0])
-	}
-	if _, _, err := s.Resolve([]ResolveItem{{ID: "c_nope", Note: "x"}}); !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "未找到") {
-		t.Fatalf("got %v", err)
-	}
-}
-
-func TestResolvePartialReportsMissing(t *testing.T) {
-	s, p := newStore(t)
-	d, _ := s.Open(p, "s1")
-	c, _ := s.AddComment(d.ID, NewComment{Quote: "正文", Body: "a"})
-	s.Send(d.ID)
-	n, missing, err := s.Resolve([]ResolveItem{{ID: "c_zz", Note: "x"}, {ID: c.ID, Note: "ok"}, {ID: "c_aa", Note: "y"}})
-	if err != nil || n != 1 || strings.Join(missing, ",") != "c_aa,c_zz" {
-		t.Fatalf("got %d %v %v", n, missing, err)
-	}
-	if g, _ := s.Get(d.ID); g.Comments[0].Status != Resolved {
-		t.Fatalf("找得到的评论应照常标记：%+v", g.Comments[0])
-	}
-}
-
 func TestSentinelErrorsAreChinese(t *testing.T) {
 	if ErrNotFound.Error() != "未找到" || ErrInvalid.Error() != "参数不合法" {
 		t.Fatalf("got %q %q", ErrNotFound, ErrInvalid)
-	}
-}
-
-func TestListBySessionCountsOpenComments(t *testing.T) {
-	s, p := newStore(t)
-	p2 := filepath.Join(filepath.Dir(p), "b.md")
-	os.WriteFile(p2, []byte("b"), 0o644)
-	d1, _ := s.Open(p, "s1")
-	s.Open(p2, "s2")
-	c, _ := s.AddComment(d1.ID, NewComment{Quote: "正文", Body: "a"})
-	s.AddComment(d1.ID, NewComment{Quote: "标题", Body: "b"})
-	s.Send(d1.ID)
-	s.Resolve([]ResolveItem{{ID: c.ID, Note: "ok"}})
-	list, err := s.ListBySession("s1")
-	if err != nil || len(list) != 1 || list[0].ID != d1.ID || list[0].Open != 1 {
-		t.Fatalf("list: %+v %v", list, err)
-	}
-}
-
-func TestListBySessionSplitsDraftsAndSent(t *testing.T) {
-	s, p := newStore(t)
-	p2 := filepath.Join(filepath.Dir(p), "b.md")
-	os.WriteFile(p2, []byte("b"), 0o644)
-	clock := time.Date(2026, 10, 11, 10, 0, 0, 0, time.UTC)
-	s.now = func() time.Time { return clock }
-	d1, _ := s.Open(p, "s1")
-	d2, _ := s.Open(p2, "s1")
-	s.AddComment(d1.ID, NewComment{Quote: "正文", Body: "a"})
-	s.AddComment(d1.ID, NewComment{Quote: "标题", Body: "b"})
-	clock = clock.Add(time.Minute)
-	s.Send(d1.ID)
-	clock = clock.Add(time.Minute)
-	s.AddComment(d1.ID, NewComment{Quote: "正文", Body: "c"})
-
-	list, err := s.ListBySession("s1")
-	if err != nil || len(list) != 2 {
-		t.Fatalf("list: %+v %v", list, err)
-	}
-	byID := map[string]DocSummary{list[0].ID: list[0], list[1].ID: list[1]}
-	a := byID[d1.ID]
-	if a.Drafts != 1 || a.Sent != 2 || a.Open != 3 {
-		t.Fatalf("草稿 1、处理中 2、未解决 3，得到 %+v", a)
-	}
-	if a.ActiveAt == nil || !a.ActiveAt.Equal(clock) {
-		t.Fatalf("activeAt 应为最近一次评论变化 %v，得到 %v", clock, a.ActiveAt)
-	}
-	b := byID[d2.ID]
-	if b.Drafts != 0 || b.Sent != 0 || b.Open != 0 || b.ActiveAt != nil {
-		t.Fatalf("没有评论的文档：%+v", b)
 	}
 }
 
@@ -253,110 +112,173 @@ func TestRevisionBumpsOnEveryWrite(t *testing.T) {
 	}
 }
 
-func TestListBySessionReportsResolvedAndOpenedAt(t *testing.T) {
+// replyStore 建两份同会话的文档 a.md、b.md，和一份别的会话的文档 c.md；时钟每次调用前进一分钟。
+func replyStore(t *testing.T) (s *Store, a, b, c Doc, clock *time.Time) {
+	t.Helper()
 	s, p := newStore(t)
-	p2 := filepath.Join(filepath.Dir(p), "b.md")
-	os.WriteFile(p2, []byte("b"), 0o644)
-	clock := time.Date(2026, 10, 12, 9, 0, 0, 0, time.UTC)
-	s.now = func() time.Time { return clock }
-	d1, _ := s.Open(p, "s1")
-	clock = clock.Add(time.Hour)
-	d2, _ := s.Open(p2, "s1")
-	c, _ := s.AddComment(d1.ID, NewComment{Quote: "正文", Body: "a"})
-	s.Send(d1.ID)
-	s.Resolve([]ResolveItem{{ID: c.ID, Note: "ok"}})
+	dir := filepath.Dir(p)
+	for _, n := range []string{"b.md", "c.md"} {
+		os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644)
+	}
+	now := time.Date(2026, 10, 18, 9, 0, 0, 0, time.UTC)
+	clock = &now
+	s.now = func() time.Time { *clock = clock.Add(time.Minute); return *clock }
+	a, _ = s.Open(p, "s1")
+	b, _ = s.Open(filepath.Join(dir, "b.md"), "s1")
+	c, _ = s.Open(filepath.Join(dir, "c.md"), "s2")
+	return
+}
 
+func TestRepliesGroupedAndNumbered(t *testing.T) {
+	s, a, b, c, _ := replyStore(t)
+	b1, _ := s.AddComment(b.ID, NewComment{Quote: "B", Body: "b1"})
+	a1, _ := s.AddComment(a.ID, NewComment{Quote: "A", Body: "a1"})
+	b2, _ := s.AddComment(b.ID, NewComment{Quote: "B", Body: "b2"})
+	s.AddComment(c.ID, NewComment{Quote: "C", Body: "别的会话"})
+
+	groups, err := s.Replies("s1")
+	if err != nil || len(groups) != 2 {
+		t.Fatalf("groups: %+v %v", groups, err)
+	}
+	if groups[0].Doc != b.ID || groups[1].Doc != a.ID || groups[0].Kind != "md" || groups[0].Path != b.Path {
+		t.Fatalf("组按组内最早一条排序，b 在前：%+v", groups)
+	}
+	got := []string{}
+	for _, g := range groups {
+		for _, r := range g.Replies {
+			got = append(got, fmt.Sprintf("%d:%s", r.No, r.ID))
+		}
+	}
+	want := []string{"1:" + b1.ID, "2:" + b2.ID, "3:" + a1.ID}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("编号：got %v want %v", got, want)
+	}
+	if other, _ := s.Replies("s3"); len(other) != 0 {
+		t.Fatalf("没有回复的会话应为空：%+v", other)
+	}
+}
+
+func TestMarkSentHidesReplies(t *testing.T) {
+	s, a, _, _, _ := replyStore(t)
+	r1, _ := s.AddComment(a.ID, NewComment{Quote: "A", Body: "1"})
+	r2, _ := s.AddComment(a.ID, NewComment{Quote: "A", Body: "2"})
+	n, missing, err := s.MarkSent([]string{r1.ID, "c_nope"})
+	if err != nil || n != 1 || strings.Join(missing, ",") != "c_nope" {
+		t.Fatalf("部分找不到：%d %v %v", n, missing, err)
+	}
+	groups, _ := s.Replies("s1")
+	if len(groups) != 1 || len(groups[0].Replies) != 1 || groups[0].Replies[0].ID != r2.ID || groups[0].Replies[0].No != 1 {
+		t.Fatalf("已发送的不再返回，剩下的重新编号：%+v", groups)
+	}
+	d, _ := s.Get(a.ID)
+	if d.Comments[0].Status != Sent || d.Comments[0].SentAt == nil {
+		t.Fatalf("文件里应为 sent：%+v", d.Comments[0])
+	}
+	if _, _, err := s.MarkSent([]string{r1.ID}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("已发送过的再标记应返回 ErrNotFound：%v", err)
+	}
+	if err := s.DeleteComment(a.ID, r1.ID); !errors.Is(err, ErrNotDraft) {
+		t.Fatalf("已发送的不能删：%v", err)
+	}
+}
+
+func TestClearRepliesOnlyThisSession(t *testing.T) {
+	s, a, b, c, _ := replyStore(t)
+	s.AddComment(a.ID, NewComment{Quote: "A", Body: "1"})
+	s.AddComment(b.ID, NewComment{Quote: "B", Body: "2"})
+	sent, _ := s.AddComment(b.ID, NewComment{Quote: "B", Body: "3"})
+	s.MarkSent([]string{sent.ID})
+	s.AddComment(c.ID, NewComment{Quote: "C", Body: "4"})
+	n, err := s.ClearReplies("s1")
+	if err != nil || n != 2 {
+		t.Fatalf("clear: %d %v", n, err)
+	}
+	if g, _ := s.Replies("s1"); len(g) != 0 {
+		t.Fatalf("应清空：%+v", g)
+	}
+	if g, _ := s.Replies("s2"); len(g) != 1 {
+		t.Fatalf("别的会话不动：%+v", g)
+	}
+	if d, _ := s.Get(b.ID); len(d.Comments) != 1 || d.Comments[0].Status != Sent {
+		t.Fatalf("已发送的保留：%+v", d.Comments)
+	}
+	if _, err := s.ClearReplies("../x"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("非法会话：%v", err)
+	}
+}
+
+func TestListBySessionPendingAndOrder(t *testing.T) {
+	s, a, b, _, _ := replyStore(t)
+	s.AddComment(a.ID, NewComment{Quote: "A", Body: "1"})
+	s.AddComment(a.ID, NewComment{Quote: "A", Body: "2"})
+	old := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	os.Chtimes(a.Path, old, old)
+	os.Chtimes(b.Path, old, old)
 	list, err := s.ListBySession("s1")
 	if err != nil || len(list) != 2 {
 		t.Fatalf("list: %+v %v", list, err)
 	}
-	byID := map[string]DocSummary{list[0].ID: list[0], list[1].ID: list[1]}
-	if a := byID[d1.ID]; a.Resolved != 1 || a.Open != 0 || a.OpenedAt == nil || !a.OpenedAt.Equal(time.Date(2026, 10, 12, 9, 0, 0, 0, time.UTC)) {
-		t.Fatalf("已解决 1、登记于 9 点，得到 %+v", a)
+	// 文件修改时间都很早时按登记时间：b 登记得晚，在前
+	if list[0].ID != b.ID || list[1].ID != a.ID || list[1].Pending != 2 || list[0].Pending != 0 {
+		t.Fatalf("顺序与待发送数：%+v", list)
 	}
-	if b := byID[d2.ID]; b.Resolved != 0 || b.Open != 0 || b.OpenedAt == nil || !b.OpenedAt.Equal(time.Date(2026, 10, 12, 10, 0, 0, 0, time.UTC)) {
-		t.Fatalf("没有评论、登记于 10 点，得到 %+v", b)
+	if list[0].ModifiedAt == nil || !list[0].ModifiedAt.Equal(old) || list[0].Kind != "md" {
+		t.Fatalf("modifiedAt：%+v", list[0])
 	}
-	// 再次登记会刷新登记时间
-	clock = clock.Add(time.Hour)
-	s.Open(p, "s1")
+	// a 的文件刚被改过：排到前面
+	future := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	os.Chtimes(a.Path, future, future)
+	list, _ = s.ListBySession("s1")
+	if list[0].ID != a.ID {
+		t.Fatalf("最近改过的在前：%+v", list)
+	}
+	os.Remove(a.Path)
 	list, _ = s.ListBySession("s1")
 	for _, d := range list {
-		if d.ID == d1.ID && !d.OpenedAt.Equal(clock) {
-			t.Fatalf("再次登记后应为 11 点，得到 %v", d.OpenedAt)
+		if d.ID == a.ID && d.ModifiedAt != nil {
+			t.Fatalf("文件不在时 modifiedAt 为空：%+v", d)
 		}
 	}
 }
 
-func TestStateOfFollowsReviewLoop(t *testing.T) {
-	s, p := newStore(t)
-	clock := time.Date(2026, 10, 12, 9, 0, 0, 0, time.UTC)
-	s.now = func() time.Time { return clock }
-	tick := func() { clock = clock.Add(time.Minute) }
-	state := func() string {
-		d, err := s.View(DocID(p))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return d.State
-	}
-	d, _ := s.Open(p, "s1")
-	if got := state(); got != StateReview {
-		t.Fatalf("刚登记：%s", got)
-	}
-	tick()
-	c, _ := s.AddComment(d.ID, NewComment{Quote: "正文", Body: "a"})
-	if got := state(); got != StateDraft {
-		t.Fatalf("写了评论：%s", got)
-	}
-	tick()
-	s.Send(d.ID)
-	if got := state(); got != StateProcessing {
-		t.Fatalf("发送后：%s", got)
-	}
-	tick()
-	s.Resolve([]ResolveItem{{ID: c.ID, Note: "ok"}})
-	if got := state(); got != StateConfirm {
-		t.Fatalf("处理完：%s", got)
-	}
-	tick()
-	if _, err := s.Approve(d.ID); err != nil {
+func TestMarkSeenBumpsRevision(t *testing.T) {
+	s, a, _, _, clock := replyStore(t)
+	r1, _ := s.Revision(a.ID)
+	if err := s.MarkSeen(a.ID); err != nil {
 		t.Fatal(err)
 	}
-	if got := state(); got != StateApproved {
-		t.Fatalf("通过后：%s", got)
+	d, _ := s.Get(a.ID)
+	if d.SeenAt == nil || !d.SeenAt.Equal(*clock) || d.Revision != r1+1 {
+		t.Fatalf("seenAt / revision：%+v", d)
 	}
-	// 通过后 Claude 又改了这篇并重新登记：回到待评审
-	tick()
-	s.Open(p, "s1")
-	if got := state(); got != StateReview {
-		t.Fatalf("通过后重新登记：%s", got)
-	}
-	// 待评审时也可以直接通过（没有意见）
-	tick()
-	if _, err := s.Approve(d.ID); err != nil || state() != StateApproved {
-		t.Fatalf("待评审直接通过：%v %s", err, state())
-	}
-	// 通过后再评论、处理完：又变成待确认
-	tick()
-	c2, _ := s.AddComment(d.ID, NewComment{Quote: "正文", Body: "b"})
-	s.Send(d.ID)
-	tick()
-	s.Resolve([]ResolveItem{{ID: c2.ID, Note: "ok"}})
-	if got := state(); got != StateConfirm {
-		t.Fatalf("通过后又一轮处理完：%s", got)
+	if err := s.MarkSeen("nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v", err)
 	}
 }
 
-func TestApproveRefusesWhenNotReady(t *testing.T) {
+func TestLegacyFieldsSurviveRoundTrip(t *testing.T) {
 	s, p := newStore(t)
-	d, _ := s.Open(p, "s1")
-	s.AddComment(d.ID, NewComment{Quote: "正文", Body: "a"})
-	if _, err := s.Approve(d.ID); !errors.Is(err, ErrNotReady) {
-		t.Fatalf("有草稿时应拒绝：%v", err)
+	id := DocID(p)
+	legacy := `{"id":"` + id + `","path":"` + p + `","kind":"md","session":"s1","revision":3,
+"approvedAt":"2026-10-12T09:00:00Z",
+"comments":[
+ {"id":"c_old1","quote":"q","body":"b","status":"resolved","createdAt":"2026-10-12T08:00:00Z","sentAt":"2026-10-12T08:30:00Z","batch":"b_20261012_083000_abcd","resolution":{"note":"改好了","at":"2026-10-12T08:40:00Z"}},
+ {"id":"c_old2","quote":"q","body":"还没发","status":"draft","createdAt":"2026-10-12T08:50:00Z","sentAt":null,"resolution":null}
+]}`
+	if err := os.WriteFile(filepath.Join(s.root, "docs", id+".json"), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	s.Send(d.ID)
-	if _, err := s.Approve(d.ID); !errors.Is(err, ErrNotReady) {
-		t.Fatalf("处理中时应拒绝：%v", err)
+	groups, err := s.Replies("s1")
+	if err != nil || len(groups) != 1 || len(groups[0].Replies) != 1 || groups[0].Replies[0].ID != "c_old2" {
+		t.Fatalf("旧草稿应作为待发送回复出现：%+v %v", groups, err)
+	}
+	if err := s.MarkSeen(id); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(s.root, "docs", id+".json"))
+	for _, want := range []string{`"approvedAt": "2026-10-12T09:00:00Z"`, `"batch": "b_20261012_083000_abcd"`, `"note": "改好了"`, `"status": "resolved"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("写回后缺 %s：%s", want, raw)
+		}
 	}
 }

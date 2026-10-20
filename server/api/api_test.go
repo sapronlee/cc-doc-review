@@ -101,7 +101,7 @@ func TestRejectsMissingOrWrongToken(t *testing.T) {
 	}
 }
 
-func TestFullCommentRoundTrip(t *testing.T) {
+func TestReplyRoundTrip(t *testing.T) {
 	e := setup(t)
 	code, body := call(t, e, "POST", "/api/open", "tok", map[string]string{"path": e.md, "session": "s1"})
 	if code != 200 {
@@ -116,54 +116,86 @@ func TestFullCommentRoundTrip(t *testing.T) {
 	}
 	id := opened.Doc.ID
 
-	code, body = call(t, e, "POST", "/api/comments", "tok", map[string]string{"doc": id, "quote": "正文", "body": "太短"})
-	if code != 200 {
-		t.Fatalf("add: %d %s", code, body)
-	}
-	c := decode[store.Comment](t, body)
-
-	code, body = call(t, e, "PATCH", "/api/comments", "tok", map[string]string{"doc": id, "id": c.ID, "body": "展开写"})
-	if code != 200 || decode[store.Comment](t, body).Body != "展开写" {
-		t.Fatalf("patch: %d %s", code, body)
+	var ids []string
+	for _, b := range []string{"太短", "再展开"} {
+		code, body = call(t, e, "POST", "/api/comments", "tok", map[string]string{"doc": id, "quote": "正文", "body": b})
+		if code != 200 {
+			t.Fatalf("add: %d %s", code, body)
+		}
+		ids = append(ids, decode[store.Comment](t, body).ID)
 	}
 
-	code, body = call(t, e, "POST", "/api/send", "tok", map[string]string{"doc": id})
-	if code != 200 {
-		t.Fatalf("send: %d %s", code, body)
+	_, body = call(t, e, "GET", "/api/replies?session=s1", "tok", nil)
+	got := decode[struct {
+		Groups []store.ReplyGroup `json:"groups"`
+		Total  int                `json:"total"`
+	}](t, body)
+	if got.Total != 2 || len(got.Groups) != 1 || got.Groups[0].Path != e.md || got.Groups[0].Replies[1].No != 2 {
+		t.Fatalf("replies: %s", body)
 	}
-	batch := decode[store.Batch](t, body)
-
-	if code, _ := call(t, e, "DELETE", "/api/comments?doc="+id+"&id="+c.ID, "tok", nil); code != 409 {
-		t.Fatalf("已发送的评论删除应返回 409，得到 %d", code)
-	}
-
-	_, body = call(t, e, "GET", "/api/outbox?session=s1", "tok", nil)
-	if got := decode[[]store.Batch](t, body); len(got) != 1 || got[0].Batch != batch.Batch {
-		t.Fatalf("outbox: %s", body)
-	}
-	if code, body := call(t, e, "POST", "/api/outbox/ack", "tok", map[string]string{"session": "s1", "batch": batch.Batch}); code != 200 {
-		t.Fatalf("ack: %d %s", code, body)
+	if _, body := call(t, e, "GET", "/api/replies?session=other", "tok", nil); string(body) != `{"groups":[],"total":0}`+"\n" {
+		t.Fatalf("别的会话应为空：%s", body)
 	}
 
 	_, body = call(t, e, "GET", "/api/docs?session=s1", "tok", nil)
-	for _, want := range []string{`"drafts":0,"sent":1,"resolved":0,"state":"processing"`, `"changedAt":`, `"activeAt":`, `"openedAt":`} {
+	for _, want := range []string{`"pending":2`, `"modifiedAt":`, `"openedAt":`, `"kind":"md"`} {
 		if !strings.Contains(string(body), want) {
-			t.Fatalf("文档列表应带各类条数、状态和时间（缺 %s）：%s", want, body)
+			t.Fatalf("文档列表缺 %s：%s", want, body)
 		}
 	}
 
-	code, body = call(t, e, "POST", "/api/resolve", "tok", map[string]any{"items": []map[string]string{{"id": c.ID, "note": "已展开"}}})
-	if code != 200 || string(body) != `{"resolved":1}`+"\n" {
-		t.Fatalf("resolve: %d %s", code, body)
+	code, body = call(t, e, "POST", "/api/replies/sent", "tok", map[string]any{"ids": []string{ids[0], "c_nope"}})
+	if code != 200 || string(body) != `{"missing":["c_nope"],"sent":1}`+"\n" {
+		t.Fatalf("sent: %d %s", code, body)
+	}
+	if code, _ := call(t, e, "POST", "/api/replies/sent", "tok", map[string]any{"ids": []string{ids[0]}}); code != 404 {
+		t.Fatalf("全部找不到应返回 404，得到 %d", code)
+	}
+	if code, _ := call(t, e, "POST", "/api/replies/sent", "tok", map[string]any{"ids": []string{}}); code != 400 {
+		t.Fatalf("空 ids 应返回 400，得到 %d", code)
+	}
+	if code, _ := call(t, e, "DELETE", "/api/comments?doc="+id+"&id="+ids[0], "tok", nil); code != 409 {
+		t.Fatalf("已发送的回复删除应返回 409，得到 %d", code)
 	}
 
 	_, body = call(t, e, "GET", "/api/doc?doc="+id, "tok", nil)
-	if d := decode[store.Doc](t, body); d.Comments[0].Status != store.Resolved {
-		t.Fatalf("doc: %s", body)
+	if d := decode[store.Doc](t, body); len(d.Comments) != 1 || d.Comments[0].ID != ids[1] {
+		t.Fatalf("文档只带待发送的回复：%s", body)
+	}
+
+	code, body = call(t, e, "DELETE", "/api/replies?session=s1", "tok", nil)
+	if code != 200 || string(body) != `{"deleted":1}`+"\n" {
+		t.Fatalf("clear: %d %s", code, body)
+	}
+	if code, _ := call(t, e, "DELETE", "/api/replies?session=../x", "tok", nil); code != 400 {
+		t.Fatalf("非法会话应返回 400，得到 %d", code)
 	}
 	_, body = call(t, e, "GET", "/api/docs?session=s1", "tok", nil)
-	if list := decode[[]store.DocSummary](t, body); len(list) != 1 || list[0].Open != 0 {
+	if list := decode[[]store.DocSummary](t, body); len(list) != 1 || list[0].Pending != 0 {
 		t.Fatalf("docs: %s", body)
+	}
+}
+
+func TestRemovedRoutesAre404(t *testing.T) {
+	e := setup(t)
+	for _, r := range []struct{ method, path string }{
+		{"POST", "/api/send"}, {"POST", "/api/approve"}, {"GET", "/api/outbox?session=s1"},
+		{"POST", "/api/outbox/ack"}, {"POST", "/api/resolve"},
+	} {
+		if code, _ := call(t, e, r.method, r.path, "tok", map[string]string{}); code != 404 {
+			t.Errorf("%s %s 应返回 404，得到 %d", r.method, r.path, code)
+		}
+	}
+}
+
+func TestReplyRoutesNeedToken(t *testing.T) {
+	e := setup(t)
+	for _, r := range []struct{ method, path string }{
+		{"GET", "/api/replies?session=s1"}, {"DELETE", "/api/replies?session=s1"}, {"POST", "/api/replies/sent"},
+	} {
+		if code, _ := call(t, e, r.method, r.path, "", map[string]any{"ids": []string{"x"}}); code != 401 {
+			t.Errorf("%s %s 无令牌应返回 401，得到 %d", r.method, r.path, code)
+		}
 	}
 }
 
@@ -209,26 +241,6 @@ func TestErrorsMapToStatus(t *testing.T) {
 	}
 }
 
-func TestResolvePartialAndAllMissing(t *testing.T) {
-	e := setup(t)
-	d, _ := e.st.Open(e.md, "s1")
-	c, _ := e.st.AddComment(d.ID, store.NewComment{Quote: "正文", Body: "x"})
-	e.st.Send(d.ID)
-	items := []map[string]string{{"id": c.ID, "note": "ok"}, {"id": "c_nope", "note": "x"}}
-	code, body := call(t, e, "POST", "/api/resolve", "tok", map[string]any{"items": items})
-	got := decode[struct {
-		Resolved int      `json:"resolved"`
-		Missing  []string `json:"missing"`
-	}](t, body)
-	if code != 200 || got.Resolved != 1 || len(got.Missing) != 1 || got.Missing[0] != "c_nope" {
-		t.Fatalf("部分找不到应返回 200 和 missing：%d %s", code, body)
-	}
-	code, body = call(t, e, "POST", "/api/resolve", "tok", map[string]any{"items": []map[string]string{{"id": "c_nope", "note": "x"}}})
-	if code != 404 || !strings.Contains(string(body), "c_nope") {
-		t.Fatalf("全部找不到应返回 404：%d %s", code, body)
-	}
-}
-
 func TestRejectsForeignHost(t *testing.T) {
 	e := setup(t)
 	port := e.srv.URL[strings.LastIndex(e.srv.URL, ":")+1:]
@@ -249,41 +261,5 @@ func TestRejectsForeignHost(t *testing.T) {
 		if res.StatusCode != want {
 			t.Errorf("Host %q: got %d, want %d", host, res.StatusCode, want)
 		}
-	}
-}
-
-func TestApproveOnlyWhenReadyAndWritesOutbox(t *testing.T) {
-	e := setup(t)
-	_, body := call(t, e, "POST", "/api/open", "tok", map[string]string{"path": e.md, "session": "s1"})
-	doc := decode[struct {
-		Doc store.Doc `json:"doc"`
-	}](t, body).Doc
-
-	_, body = call(t, e, "GET", "/api/doc?doc="+doc.ID, "tok", nil)
-	if !strings.Contains(string(body), `"state":"review"`) {
-		t.Fatalf("刚登记应为待评审：%s", body)
-	}
-	call(t, e, "POST", "/api/comments", "tok", map[string]string{"doc": doc.ID, "quote": "正文", "body": "改一下"})
-	if code, body := call(t, e, "POST", "/api/approve", "tok", map[string]string{"doc": doc.ID}); code != 409 || !strings.Contains(string(body), "没发送") {
-		t.Fatalf("有未发送评论时不能通过：%d %s", code, body)
-	}
-	_, body = call(t, e, "POST", "/api/send", "tok", map[string]string{"doc": doc.ID})
-	batch := decode[store.Batch](t, body)
-	call(t, e, "POST", "/api/outbox/ack", "tok", map[string]string{"session": "s1", "batch": batch.Batch})
-	call(t, e, "POST", "/api/resolve", "tok", map[string]any{"items": []map[string]string{{"id": batch.Comments[0].ID, "note": "改好了"}}})
-	_, body = call(t, e, "GET", "/api/doc?doc="+doc.ID, "tok", nil)
-	if !strings.Contains(string(body), `"state":"confirm"`) {
-		t.Fatalf("处理完应为待确认：%s", body)
-	}
-	code, body := call(t, e, "POST", "/api/approve", "tok", map[string]string{"doc": doc.ID})
-	if code != 200 || !strings.Contains(string(body), `"kind":"approve"`) {
-		t.Fatalf("approve: %d %s", code, body)
-	}
-	_, body = call(t, e, "GET", "/api/outbox?session=s1", "tok", nil)
-	if got := decode[[]store.Batch](t, body); len(got) != 1 || got[0].Kind != store.KindApprove || got[0].Doc != doc.ID {
-		t.Fatalf("outbox 应有一条通过消息：%s", body)
-	}
-	if code, _ := call(t, e, "POST", "/api/approve", "tok", map[string]string{"doc": doc.ID}); code != 409 {
-		t.Fatalf("重复通过应被拒绝：%d", code)
 	}
 }

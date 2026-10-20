@@ -1,4 +1,4 @@
-// Package store 保存登记的文档和评论，是数据目录的唯一写入者。
+// Package store 保存登记的文档和回复，是数据目录的唯一写入者。
 package store
 
 import (
@@ -19,13 +19,12 @@ import (
 
 var (
 	ErrNotFound    = errors.New("未找到")
-	ErrNotDraft    = errors.New("只有草稿可以修改或删除")
-	ErrNoDrafts    = errors.New("没有待发送的评论")
+	ErrNotDraft    = errors.New("只有待发送的回复可以修改或删除")
 	ErrUnsupported = errors.New("只支持 .md、.markdown、.html、.htm 文件")
 	ErrInvalid     = errors.New("参数不合法")
-	ErrNotReady    = errors.New("现在不能通过")
 )
 
+// Status 是回复的状态：draft 为待发送，sent 为已发给 Claude；resolved 只出现在 0.2.0 的旧数据里。
 type Status string
 
 const (
@@ -34,20 +33,22 @@ const (
 	Resolved Status = "resolved"
 )
 
+// Resolution 是 0.2.0 的处理结果，只为读入旧数据后原样写回。
 type Resolution struct {
 	Note string    `json:"note"`
 	At   time.Time `json:"at"`
 }
 
 type Comment struct {
-	ID         string      `json:"id"`
-	Quote      string      `json:"quote"`
-	Prefix     string      `json:"prefix"`
-	Suffix     string      `json:"suffix"`
-	Body       string      `json:"body"`
-	Status     Status      `json:"status"`
-	CreatedAt  time.Time   `json:"createdAt"`
-	SentAt     *time.Time  `json:"sentAt"`
+	ID        string     `json:"id"`
+	Quote     string     `json:"quote"`
+	Prefix    string     `json:"prefix"`
+	Suffix    string     `json:"suffix"`
+	Body      string     `json:"body"`
+	Status    Status     `json:"status"`
+	CreatedAt time.Time  `json:"createdAt"`
+	SentAt    *time.Time `json:"sentAt"`
+	// Batch、Resolution 是 0.2.0 的旧字段，不再使用，只为原样写回。
 	Batch      string      `json:"batch,omitempty"`
 	Resolution *Resolution `json:"resolution"`
 }
@@ -61,112 +62,10 @@ type Doc struct {
 	Comments []Comment `json:"comments"`
 	// OpenedAt 是最近一次登记（Open）的时间；旧数据没有这个字段。
 	OpenedAt *time.Time `json:"openedAt,omitempty"`
-	// ApprovedAt 是最近一次「通过」的时间，没通过过时省略。
+	// SeenAt 是用户最近一次打开文档页的时间，没打开过时省略。
+	SeenAt *time.Time `json:"seenAt,omitempty"`
+	// ApprovedAt 是 0.2.0「通过」的时间，不再使用，只为原样写回。
 	ApprovedAt *time.Time `json:"approvedAt,omitempty"`
-}
-
-// 文档的评审状态（见 docs/superpowers/specs/2026-10-12-review-states-design.md）。
-const (
-	StateReview     = "review"     // 待评审：写完或改完，还没给结论
-	StateDraft      = "draft"      // 未发送：有还没发给 Claude 的评论
-	StateProcessing = "processing" // 处理中：评论已发给 Claude，还没处理完
-	StateConfirm    = "confirm"    // 待确认：上次通过后有评论被解决，等核对
-	StateApproved   = "approved"   // 已通过
-)
-
-// StateOf 按「未发送 → 处理中 → 已通过 → 待确认 → 待评审」的顺序判断文档状态，
-// 同时给出最近一次变化（登记、评论新建 / 发送 / 解决、通过）的时间；什么都没有时为零值。
-func StateOf(d Doc) (string, time.Time) {
-	var changed time.Time
-	later := func(t *time.Time) {
-		if t != nil && t.After(changed) {
-			changed = *t
-		}
-	}
-	later(d.OpenedAt)
-	later(d.ApprovedAt)
-	drafts, sent := 0, 0
-	var lastResolved *time.Time
-	for _, c := range d.Comments {
-		created := c.CreatedAt
-		later(&created)
-		later(c.SentAt)
-		switch c.Status {
-		case Draft:
-			drafts++
-		case Sent:
-			sent++
-		case Resolved:
-			if at := resolvedAt(c); at != nil && (lastResolved == nil || at.After(*lastResolved)) {
-				lastResolved = at
-			}
-		}
-		later(resolvedAt(c))
-	}
-	after := func(a, b *time.Time) bool { return a != nil && (b == nil || a.After(*b)) }
-	switch {
-	case drafts > 0:
-		return StateDraft, changed
-	case sent > 0:
-		return StateProcessing, changed
-	case d.ApprovedAt != nil && !after(d.OpenedAt, d.ApprovedAt) && !after(lastResolved, d.ApprovedAt):
-		return StateApproved, changed
-	case after(lastResolved, d.ApprovedAt) && !after(d.OpenedAt, lastResolved):
-		return StateConfirm, changed
-	default:
-		return StateReview, changed
-	}
-}
-
-// DocView 是评审页读取的文档：文档本身加当前评审状态。
-type DocView struct {
-	Doc
-	State string `json:"state"`
-}
-
-// View 读取文档并算出当前状态。
-func (s *Store) View(id string) (DocView, error) {
-	d, err := s.Get(id)
-	if err != nil {
-		return DocView{}, err
-	}
-	state, _ := StateOf(d)
-	return DocView{Doc: d, State: state}, nil
-}
-
-// Approve 通过文档：只有待评审、待确认时可以；记录通过时间，并往文档所属会话的 outbox 写一条通过消息。
-func (s *Store) Approve(docID string) (Batch, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	d, err := s.load(docID)
-	if err != nil {
-		return Batch{}, err
-	}
-	switch state, _ := StateOf(d); state {
-	case StateDraft:
-		return Batch{}, fmt.Errorf("%w：还有没发送的评论，先发给 Claude 或删掉", ErrNotReady)
-	case StateProcessing:
-		return Batch{}, fmt.Errorf("%w：Claude 还在处理评论", ErrNotReady)
-	case StateApproved:
-		return Batch{}, fmt.Errorf("%w：已经通过了", ErrNotReady)
-	}
-	now := s.now()
-	d.ApprovedAt = &now
-	b := Batch{
-		Batch:    fmt.Sprintf("b_%s_%s", now.Format("20060102_150405"), randomID("")[:4]),
-		Kind:     KindApprove,
-		Doc:      d.ID,
-		Path:     d.Path,
-		Comments: []BatchComment{},
-	}
-	dir := filepath.Join(s.root, "outbox", d.Session)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return Batch{}, err
-	}
-	if err := writeJSON(filepath.Join(dir, b.Batch+".json"), b); err != nil {
-		return Batch{}, err
-	}
-	return b, s.save(&d)
 }
 
 type NewComment struct {
@@ -185,10 +84,8 @@ type Store struct {
 }
 
 func New(root string) (*Store, error) {
-	for _, d := range []string{"docs", "outbox"} {
-		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
-			return nil, err
-		}
+	if err := os.MkdirAll(filepath.Join(root, "docs"), 0o755); err != nil {
+		return nil, err
 	}
 	return &Store{root: root, now: time.Now}, nil
 }
@@ -248,7 +145,7 @@ func (s *Store) Get(id string) (Doc, error) {
 
 func (s *Store) AddComment(docID string, in NewComment) (Comment, error) {
 	if strings.TrimSpace(in.Quote) == "" || strings.TrimSpace(in.Body) == "" {
-		return Comment{}, fmt.Errorf("%w：引用的原文和评论内容都不能为空", ErrInvalid)
+		return Comment{}, fmt.Errorf("%w：引用的原文和回复内容都不能为空", ErrInvalid)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -262,27 +159,6 @@ func (s *Store) AddComment(docID string, in NewComment) (Comment, error) {
 	}
 	d.Comments = append(d.Comments, c)
 	return c, s.save(&d)
-}
-
-func (s *Store) UpdateComment(docID, id, body string) (Comment, error) {
-	if strings.TrimSpace(body) == "" {
-		return Comment{}, fmt.Errorf("%w：评论内容不能为空", ErrInvalid)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	d, err := s.load(docID)
-	if err != nil {
-		return Comment{}, err
-	}
-	c, err := findComment(&d, id)
-	if err != nil {
-		return Comment{}, err
-	}
-	if c.Status != Draft {
-		return Comment{}, ErrNotDraft
-	}
-	c.Body = body
-	return *c, s.save(&d)
 }
 
 func (s *Store) DeleteComment(docID, id string) error {
@@ -315,7 +191,7 @@ func findComment(d *Doc, id string) (*Comment, error) {
 			return &d.Comments[i], nil
 		}
 	}
-	return nil, fmt.Errorf("%w：评论 %s", ErrNotFound, id)
+	return nil, fmt.Errorf("%w：回复 %s", ErrNotFound, id)
 }
 
 func (s *Store) docPath(id string) string {
@@ -337,7 +213,7 @@ func (s *Store) load(id string) (Doc, error) {
 	return d, nil
 }
 
-// save 每次写入都递增 Revision，SSE 靠它发现评论变化。
+// save 每次写入都递增 Revision，SSE 靠它发现回复变化。
 func (s *Store) save(d *Doc) error {
 	d.Revision++
 	return writeJSON(s.docPath(d.ID), d)
@@ -361,138 +237,75 @@ func randomID(prefix string) string {
 	return prefix + hex.EncodeToString(b)
 }
 
-type BatchComment struct {
-	ID    string `json:"id"`
-	Quote string `json:"quote"`
-	Body  string `json:"body"`
+// ReplyGroup 是一份文档里待发送的回复。
+type ReplyGroup struct {
+	Doc     string  `json:"doc"`
+	Path    string  `json:"path"`
+	Kind    string  `json:"kind"`
+	Replies []Reply `json:"replies"`
 }
 
-// KindApprove 是「通过」消息的批次类型；评论批次不带 kind。
-const KindApprove = "approve"
-
-type Batch struct {
-	Batch    string         `json:"batch"`
-	Kind     string         `json:"kind,omitempty"`
-	Doc      string         `json:"doc"`
-	Path     string         `json:"path"`
-	Comments []BatchComment `json:"comments"`
+// Reply 是一条待发送的回复；No 是本会话内从 1 起的全局编号。
+type Reply struct {
+	ID        string    `json:"id"`
+	No        int       `json:"no"`
+	Quote     string    `json:"quote"`
+	Prefix    string    `json:"prefix"`
+	Suffix    string    `json:"suffix"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"createdAt"`
 }
 
-type ResolveItem struct {
-	ID   string `json:"id"`
-	Note string `json:"note"`
-}
-
-// DocSummary 是文档的评论概况：Open 为未解决总数（= Drafts + Sent）。
-// ActiveAt 是最近一次评论变化（新建、发送、解决）的时间，没有评论时省略。
-type DocSummary struct {
-	ID       string `json:"id"`
-	Path     string `json:"path"`
-	Open     int    `json:"open"`
-	Drafts   int    `json:"drafts"`
-	Sent     int    `json:"sent"`
-	Resolved int    `json:"resolved"`
-	// State 是评审状态（review / draft / processing / confirm / approved），ChangedAt 是最近一次变化的时间。
-	State     string     `json:"state"`
-	ChangedAt *time.Time `json:"changedAt,omitempty"`
-	ActiveAt  *time.Time `json:"activeAt,omitempty"`
-	// OpenedAt 是最近一次登记的时间，旧数据没有时省略。
-	OpenedAt *time.Time `json:"openedAt,omitempty"`
-}
-
-var validBatch = regexp.MustCompile(`^b_[0-9]{8}_[0-9]{6}_[0-9a-f]{4}$`)
-
-// Send 把文档的全部草稿变为处理中，并写一个批次到文档所属会话的 outbox。
-func (s *Store) Send(docID string) (Batch, error) {
+// Replies 取会话下所有文档里待发送的回复，按文档分组：组按组内最早一条排序，组内按加入时间排序，编号跨组连续。
+func (s *Store) Replies(session string) ([]ReplyGroup, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	d, err := s.load(docID)
-	if err != nil {
-		return Batch{}, err
-	}
-	now := s.now()
-	b := Batch{
-		Batch: fmt.Sprintf("b_%s_%s", now.Format("20060102_150405"), randomID("")[:4]),
-		Doc:   d.ID,
-		Path:  d.Path,
-	}
-	for i := range d.Comments {
-		c := &d.Comments[i]
-		if c.Status != Draft {
-			continue
-		}
-		at := now
-		c.Status, c.SentAt, c.Batch = Sent, &at, b.Batch
-		b.Comments = append(b.Comments, BatchComment{ID: c.ID, Quote: c.Quote, Body: c.Body})
-	}
-	if len(b.Comments) == 0 {
-		return Batch{}, ErrNoDrafts
-	}
-	dir := filepath.Join(s.root, "outbox", d.Session)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return Batch{}, err
-	}
-	if err := writeJSON(filepath.Join(dir, b.Batch+".json"), b); err != nil {
-		return Batch{}, err
-	}
-	return b, s.save(&d)
-}
-
-func (s *Store) Outbox(session string) ([]Batch, error) {
-	if !validSession.MatchString(session) {
-		return nil, fmt.Errorf("%w：会话 ID 不合法", ErrInvalid)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	dir := filepath.Join(s.root, "outbox", session)
-	entries, err := os.ReadDir(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		return []Batch{}, nil
-	}
+	docs, err := s.allDocs()
 	if err != nil {
 		return nil, err
 	}
-	out := []Batch{}
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".json") {
+	groups := []ReplyGroup{}
+	for _, d := range docs {
+		if d.Session != session {
 			continue
 		}
-		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
-		if err != nil {
-			return nil, err
+		g := ReplyGroup{Doc: d.ID, Path: d.Path, Kind: d.Kind}
+		for _, c := range d.Comments {
+			if c.Status == Draft {
+				g.Replies = append(g.Replies, Reply{ID: c.ID, Quote: c.Quote, Prefix: c.Prefix, Suffix: c.Suffix, Body: c.Body, CreatedAt: c.CreatedAt})
+			}
 		}
-		var b Batch
-		if err := json.Unmarshal(raw, &b); err != nil {
-			return nil, err
+		if len(g.Replies) == 0 {
+			continue
 		}
-		out = append(out, b)
+		sort.SliceStable(g.Replies, func(i, j int) bool { return g.Replies[i].CreatedAt.Before(g.Replies[j].CreatedAt) })
+		groups = append(groups, g)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Batch < out[j].Batch })
-	return out, nil
+	sort.SliceStable(groups, func(i, j int) bool {
+		a, b := groups[i].Replies[0].CreatedAt, groups[j].Replies[0].CreatedAt
+		if a.Equal(b) {
+			return groups[i].Path < groups[j].Path
+		}
+		return a.Before(b)
+	})
+	no := 0
+	for gi := range groups {
+		for ri := range groups[gi].Replies {
+			no++
+			groups[gi].Replies[ri].No = no
+		}
+	}
+	return groups, nil
 }
 
-// Ack 确认批次已送达并删除；重复确认不报错。
-func (s *Store) Ack(session, batch string) error {
-	if !validSession.MatchString(session) || !validBatch.MatchString(batch) {
-		return fmt.Errorf("%w：会话或批次名不合法", ErrInvalid)
-	}
+// MarkSent 把这些回复标为已发送，返回标记的条数和不再是待发送（或找不到）的 ID（已排序）。
+// 一个都标不了时返回 ErrNotFound。
+func (s *Store) MarkSent(ids []string) (int, []string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	err := os.Remove(filepath.Join(s.root, "outbox", session, batch+".json"))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	return err
-}
-
-// Resolve 按评论 ID 跨文档标记已解决，返回标记的条数和找不到的 ID（已排序）。
-// 只有一个都找不到时才返回 ErrNotFound；部分找不到时其余照常处理。
-func (s *Store) Resolve(items []ResolveItem) (int, []string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	want := map[string]string{}
-	for _, it := range items {
-		want[it.ID] = it.Note
+	want := map[string]bool{}
+	for _, id := range ids {
+		want[id] = true
 	}
 	total := len(want)
 	docs, err := s.allDocs()
@@ -500,20 +313,17 @@ func (s *Store) Resolve(items []ResolveItem) (int, []string, error) {
 		return 0, nil, err
 	}
 	done := 0
+	now := s.now()
 	for _, d := range docs {
 		changed := false
 		for i := range d.Comments {
 			c := &d.Comments[i]
-			note, ok := want[c.ID]
-			if !ok {
+			if !want[c.ID] || c.Status != Draft {
 				continue
 			}
 			delete(want, c.ID)
-			if c.Status == Resolved {
-				continue
-			}
-			c.Status = Resolved
-			c.Resolution = &Resolution{Note: note, At: s.now()}
+			at := now
+			c.Status, c.SentAt = Sent, &at
 			changed = true
 			done++
 		}
@@ -528,12 +338,72 @@ func (s *Store) Resolve(items []ResolveItem) (int, []string, error) {
 		missing = append(missing, id)
 	}
 	sort.Strings(missing)
-	if total > 0 && len(missing) == total {
-		return 0, missing, fmt.Errorf("%w：评论 %s", ErrNotFound, strings.Join(missing, "、"))
+	if total > 0 && done == 0 {
+		return 0, missing, fmt.Errorf("%w：回复 %s", ErrNotFound, strings.Join(missing, "、"))
 	}
 	return done, missing, nil
 }
 
+// ClearReplies 删掉会话下所有待发送的回复，返回删掉的条数。
+func (s *Store) ClearReplies(session string) (int, error) {
+	if !validSession.MatchString(session) {
+		return 0, fmt.Errorf("%w：会话 ID 不合法", ErrInvalid)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	docs, err := s.allDocs()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, d := range docs {
+		if d.Session != session {
+			continue
+		}
+		kept := d.Comments[:0]
+		for _, c := range d.Comments {
+			if c.Status == Draft {
+				n++
+				continue
+			}
+			kept = append(kept, c)
+		}
+		if len(kept) == len(d.Comments) {
+			continue
+		}
+		d.Comments = kept
+		if err := s.save(&d); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+// MarkSeen 记下用户打开文档页的时间，文档面板据此判断「新」。
+func (s *Store) MarkSeen(docID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, err := s.load(docID)
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	d.SeenAt = &now
+	return s.save(&d)
+}
+
+// DocSummary 是文档面板里的一份文档。ModifiedAt 是文件修改时间（文件不在时省略），Pending 是待发送的回复数。
+type DocSummary struct {
+	ID         string     `json:"id"`
+	Path       string     `json:"path"`
+	Kind       string     `json:"kind"`
+	OpenedAt   *time.Time `json:"openedAt,omitempty"`
+	ModifiedAt *time.Time `json:"modifiedAt,omitempty"`
+	SeenAt     *time.Time `json:"seenAt,omitempty"`
+	Pending    int        `json:"pending"`
+}
+
+// ListBySession 列出会话登记过的文档，最近更新（文件修改或登记，取较晚的）的在前。
 func (s *Store) ListBySession(session string) ([]DocSummary, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -546,40 +416,35 @@ func (s *Store) ListBySession(session string) ([]DocSummary, error) {
 		if d.Session != session {
 			continue
 		}
-		sum := DocSummary{ID: d.ID, Path: d.Path, OpenedAt: d.OpenedAt}
-		for _, c := range d.Comments {
-			switch c.Status {
-			case Draft:
-				sum.Drafts++
-			case Sent:
-				sum.Sent++
-			case Resolved:
-				sum.Resolved++
-			}
-			for _, at := range []*time.Time{&c.CreatedAt, c.SentAt, resolvedAt(c)} {
-				if at != nil && (sum.ActiveAt == nil || at.After(*sum.ActiveAt)) {
-					t := *at
-					sum.ActiveAt = &t
-				}
-			}
+		sum := DocSummary{ID: d.ID, Path: d.Path, Kind: d.Kind, OpenedAt: d.OpenedAt, SeenAt: d.SeenAt}
+		if st, err := os.Stat(d.Path); err == nil {
+			mt := st.ModTime()
+			sum.ModifiedAt = &mt
 		}
-		sum.Open = sum.Drafts + sum.Sent
-		state, changed := StateOf(d)
-		sum.State = state
-		if !changed.IsZero() {
-			sum.ChangedAt = &changed
+		for _, c := range d.Comments {
+			if c.Status == Draft {
+				sum.Pending++
+			}
 		}
 		out = append(out, sum)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
-	return out, nil
-}
-
-func resolvedAt(c Comment) *time.Time {
-	if c.Resolution == nil {
-		return nil
+	latest := func(d DocSummary) time.Time {
+		var t time.Time
+		for _, at := range []*time.Time{d.ModifiedAt, d.OpenedAt} {
+			if at != nil && at.After(t) {
+				t = *at
+			}
+		}
+		return t
 	}
-	return &c.Resolution.At
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := latest(out[i]), latest(out[j])
+		if a.Equal(b) {
+			return out[i].Path < out[j].Path
+		}
+		return a.After(b)
+	})
+	return out, nil
 }
 
 func (s *Store) Revision(id string) (int, error) {

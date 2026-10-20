@@ -1,53 +1,39 @@
-// 工具说明：模型据此决定何时打开评审页、如何回报处理结果。
-// 规则写在 review_open 的说明里，不加进系统提示：没用到评审的会话里插件不占系统提示（休眠模式）。
+// open_doc 的工具说明和返回给 Claude 的文字。说明写在工具里，不加进系统提示：没用到文档回复的会话里插件不占系统提示（休眠模式）。
 
-export const OPEN_TOOL = 'mcp__cc-doc-review__review_open'
-export const RESOLVE_TOOL = 'mcp__cc-doc-review__review_resolve'
-export const STATUS_TOOL = 'mcp__cc-doc-review__review_status'
+import { displayName } from './bandview.js'
+import { t } from './i18n.js'
+import { shownPath } from './reply.js'
+
+export const OPEN_TOOL = 'mcp__cc-doc-review__open_doc'
 
 export const OPEN_SPEC = {
-  name: 'review_open',
-  description: `登记一个 md 或 HTML 文件供用户划词评论，返回评审页链接。
-何时调用：你为用户生成或大幅修改了需要用户阅读评审的 md 或 HTML 文件（方案、设计、文案、报告、页面等），写完后调用，传入文件路径。随代码改动顺带修改的 README、CHANGELOG、CLAUDE.md 等不需要调用。
-只在主对话里调用；子代理不要调用 review_open，也不要打开评审页。
-拿到结果后按返回文字里的「展示方式」给用户看：能在对话中渲染 HTML 卡片时画评审卡片，否则给出链接；用户要在浏览器面板看时用 preview_start 传 url 打开（面板已打开时用 navigate）。
-用户在评审页里发送的评论会以「[文档评审]」开头的消息送达，也可能附在用户的消息上。逐条处理：按意见修改文件；每条处理完调用 ${RESOLVE_TOOL}，写清改了什么，没改的说明原因。
-用户问评审进度、要看评论时调用 ${STATUS_TOOL}。`,
+  name: 'open_doc',
+  description: `Register a Markdown or HTML file so the user can select text in it and reply to you, the way they quote a message in chat. Registering is not a review: the user does not need to confirm or approve anything.
+When to call: after you write or substantially revise a document meant for the user to read (a plan, design, report, copy, page), pass its path. Also call it whenever the user asks to comment on, reply to, review or mark up a file: pass that file's path, even one you did not write. Call it for files that were registered automatically too, to get the link. Skip README, CHANGELOG, CLAUDE.md and similar files edited alongside code. Only call it from the main conversation, never from a subagent.
+Then put the returned link in your reply, so the user can open the document.
+The user's replies arrive in a message that starts with "[文档回复]" or "[Doc reply]": each reply is numbered (<!-- reply N -->) and quotes the text it is about. Answer every reply by its number in your response: what you changed, or why you did not.`,
   inputSchema: {
     type: 'object',
-    properties: { path: { type: 'string', description: '文件路径，绝对路径或相对当前工作目录' } },
+    properties: { path: { type: 'string', description: 'Path of the .md or .html file, absolute or relative to the working directory' } },
     required: ['path'],
   },
   isDeferred: false,
 }
 
-export const RESOLVE_SPEC = {
-  name: 'review_resolve',
-  description: '把用户的评审评论标记为已解决，并写明处理说明。可一次处理多条。',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      items: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            id: { type: 'string', description: '评论 ID，形如 c_8f2a1b3c' },
-            note: { type: 'string', description: '怎么改的；没改就写原因' },
-          },
-          required: ['id', 'note'],
-        },
-      },
-    },
-    required: ['items'],
-  },
-  isDeferred: false,
-}
+/**
+ * open_doc 返回给 Claude 的文字：只有路径和链接（附一个可以直接放进回话的 Markdown 链接）。
+ * @param {string} path @param {string} url @param {string} cwd @param {import('./i18n.js').Lang} lang
+ */
+/** 让 Claude 有内置浏览器（桌面版旁边的浏览器面板）时直接在里面打开文档页：插件自己调不动那个浏览器。*/
+export const BROWSER_HINT =
+  "If you have a tool that opens a page in a browser pane inside this app (such as the desktop app's built-in browser), open the Link there now so the user can reply beside this conversation; never use the user's own browser for it. Still put the reply link in your answer."
 
-export const STATUS_SPEC = {
-  name: 'review_status',
-  description: `查看本会话的文档评审进度：各文档的路径、评审链接、待发送 / 处理中 / 已解决条数，以及待处理（已发送、还没解决）的评论（ID、原文、意见）。
-用户说「评审进度」「看评论」「还有哪些评论没处理」时调用；按返回文字里的「展示方式」给用户看（能渲染 HTML 卡片时画汇总卡片）。`,
-  inputSchema: { type: 'object', properties: {} },
-  isDeferred: false,
+export function openText(path, url, cwd, lang) {
+  const label = t(lang, 'openLink', { name: displayName(path, 40) }).replace(/[\\[\]]/g, ch => `\\${ch}`)
+  return [
+    `Registered: ${shownPath(path, cwd)}`,
+    `Link: ${url}`,
+    `For your reply: [${label}](${url})`,
+    BROWSER_HINT,
+  ].join('\n')
 }

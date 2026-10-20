@@ -39,7 +39,7 @@ test('platformOf：识别 macOS 和 Linux 的两种芯片，其余不支持', as
 test('assetName 与 releaseUrl 拼出 Release 里的文件名和下载地址', async () => {
   expect(assetName({ os: 'darwin', arch: 'arm64' })).toBe('cc-doc-review-server-darwin-arm64')
   expect(releaseUrl('0.2.0', 'SHA256SUMS')).toBe(
-    'https://github.com/sapronlee/CC-Doc-Review/releases/download/v0.2.0/SHA256SUMS',
+    'https://github.com/sapronlee/cc-doc-review/releases/download/v0.2.0/SHA256SUMS',
   )
 })
 

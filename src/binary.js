@@ -3,7 +3,7 @@
 import { dataDirOf } from './client.js'
 
 /** 发布程序的 GitHub 仓库。*/
-const REPO = 'sapronlee/CC-Doc-Review'
+const REPO = 'sapronlee/cc-doc-review'
 /** 版本号的合法格式：进下载地址、文件名和命令参数前先过一遍。*/
 const VERSION_RE = /^\d+\.\d+\.\d+([-+][0-9A-Za-z][0-9A-Za-z.-]*)?$/
 const SHA_RE = /\b[0-9a-fA-F]{64}\b/
@@ -165,7 +165,7 @@ export function serverPid(info) {
   return typeof pid === 'number' && Number.isInteger(pid) && pid > 1 ? pid : undefined
 }
 
-/** 进程命令行是不是新版评审服务（程序名 cc-doc-review-server，带不带版本后缀都算）；旧版 doc-review-server 不算。@param {string} command */
+/** 进程命令行是不是新版文档服务（程序名 cc-doc-review-server，带不带版本后缀都算）；旧版 doc-review-server 不算。@param {string} command */
 export function isServerCommand(command) {
   return /(^|[\s/])cc-doc-review-server(-[0-9A-Za-z.+-]+)?(\s|$)/.test(command.trim())
 }

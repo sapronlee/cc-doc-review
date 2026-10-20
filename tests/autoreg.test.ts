@@ -65,8 +65,8 @@ test('逗号分隔的模式串：大括号里的逗号不拆，去掉空白和�
   expect(splitPatterns('')).toEqual([])
   expect(splitPatterns('   ')).toEqual([])
   expect(splitPatterns(undefined)).toEqual([])
-  expect(splitPatterns(DEFAULT_INCLUDE).length).toBe(3)
-  expect(splitPatterns(DEFAULT_EXCLUDE).length).toBe(9)
+  expect(splitPatterns(DEFAULT_INCLUDE).length).toBe(1)
+  expect(splitPatterns(DEFAULT_EXCLUDE).length).toBe(17)
 })
 
 test('配置：缺省用默认值，字符串和开关按给定的来', () => {
@@ -84,22 +84,18 @@ test('配置：缺省用默认值，字符串和开关按给定的来', () => {
   )
 })
 
-test('自动登记：默认只收 specs / plans / docs 下的文档', () => {
+test('自动登记：默认收工作目录里所有 md、markdown、html、htm 文档', () => {
   expect(isReviewDoc('/proj/docs/superpowers/specs/2026-10-11-design.md', '/proj', cfg)).toBe(true)
   expect(isReviewDoc('/proj/specs/page.html', '/proj', cfg)).toBe(true)
-  expect(isReviewDoc('/proj/plans/rollout.html', '/proj', cfg)).toBe(true)
-  expect(isReviewDoc('/proj/docs/rollout.markdown', '/proj', cfg)).toBe(true)
-  expect(isReviewDoc('/proj/docs/page.htm', '/proj', cfg)).toBe(true)
-  // specs / plans 只收 md、html
-  expect(isReviewDoc('/proj/plans/rollout.markdown', '/proj', cfg)).toBe(false)
-  expect(isReviewDoc('/proj/src/notes.md', '/proj', cfg)).toBe(false)
-  expect(isReviewDoc('/proj/mydocs/notes.md', '/proj', cfg)).toBe(false)
+  expect(isReviewDoc('/proj/plans/rollout.markdown', '/proj', cfg)).toBe(true)
+  expect(isReviewDoc('/proj/src/notes.md', '/proj', cfg)).toBe(true)
+  expect(isReviewDoc('/proj/report.htm', '/proj', cfg)).toBe(true)
+  expect(isReviewDoc('/proj/docs.md', '/proj', cfg)).toBe(true)
+  // 不是文档的不收
   expect(isReviewDoc('/proj/docs/notes.txt', '/proj', cfg)).toBe(false)
+  expect(isReviewDoc('/proj/src/a.ts', '/proj', cfg)).toBe(false)
   // 不区分大小写
-  expect(isReviewDoc('/proj/Docs/page.htm', '/proj', cfg)).toBe(true)
-  expect(isReviewDoc('/proj/specs/page.HTML', '/proj', cfg)).toBe(true)
-  // 文件名本身叫 docs.md 不算在 docs 目录里
-  expect(isReviewDoc('/proj/docs.md', '/proj', cfg)).toBe(false)
+  expect(isReviewDoc('/proj/Docs/page.HTML', '/proj', cfg)).toBe(true)
   expect(isReviewDoc('', '/proj', cfg)).toBe(false)
 })
 
@@ -114,7 +110,10 @@ test('自动登记：默认排除优先于包含', () => {
   expect(isReviewDoc('/proj/Node_Modules/x/docs/a.md', '/proj', cfg)).toBe(false)
   expect(isReviewDoc('/proj/docs/CHANGELOG.md', '/proj', cfg)).toBe(false)
   expect(isReviewDoc('/proj/docs/CLAUDE.md', '/proj', cfg)).toBe(false)
-  for (const dir of ['vendor', 'dist', '.git', '.claude']) {
+  for (const name of ['AGENTS.md', 'LICENSE.md', 'CONTRIBUTING.md', 'SECURITY.md', 'CODE_OF_CONDUCT.md']) {
+    expect(isReviewDoc(`/proj/${name}`, '/proj', cfg)).toBe(false)
+  }
+  for (const dir of ['vendor', 'dist', '.git', '.claude', '.github', 'build', 'coverage']) {
     expect(isReviewDoc(`/proj/${dir}/docs/x.md`, '/proj', cfg)).toBe(false)
   }
   // 自定义时同样排除优先
@@ -128,8 +127,8 @@ test('自动登记只看工作目录内的相对路径', () => {
   expect(isReviewDoc('/other/docs/x.md', '/proj', cfg)).toBe(false)
   expect(isReviewDoc('/projx/docs/x.md', '/proj', cfg)).toBe(false)
   expect(isReviewDoc('/proj/../other/docs/x.md', '/proj', cfg)).toBe(false)
-  // 工作目录本身在 docs 下不算
-  expect(isReviewDoc('/home/docs/proj/notes.md', '/home/docs/proj', cfg)).toBe(false)
+  // 只看工作目录内的相对路径：工作目录本身在 node_modules 下也照收
+  expect(isReviewDoc('/home/node_modules/proj/notes.md', '/home/node_modules/proj', cfg)).toBe(true)
   expect(isReviewDoc('/home/docs/proj/specs/a.md', '/home/docs/proj/', cfg)).toBe(true)
   // 路径里的 ./ 段不影响匹配
   expect(isReviewDoc('/proj/./docs/x.md', '/proj', cfg)).toBe(true)

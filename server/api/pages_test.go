@@ -63,10 +63,13 @@ func TestReviewShowsMissingPageForDeletedHTML(t *testing.T) {
 	os.WriteFile(p, []byte("<p>x</p>"), 0o644)
 	d, _ := e.st.Open(p, "s1")
 	os.Remove(p)
-	code, body := call(t, e, "GET", "/review?doc="+d.ID+"&t=tok", "", nil)
+	code, body := call(t, e, "GET", "/review?doc="+d.ID+"&t=tok&lang=zh", "", nil)
 	s := string(body)
 	if code != 404 || !strings.Contains(s, "文件不存在或无法读取") || !strings.Contains(s, `data-doc-review="html"`) {
-		t.Fatalf("应返回带评审脚本的提示页：%d %s", code, s)
+		t.Fatalf("应返回带脚本的提示页：%d %s", code, s)
+	}
+	if _, en := call(t, e, "GET", "/review?doc="+d.ID+"&t=tok", "", nil); !strings.Contains(string(en), "File not found") {
+		t.Fatalf("不带 lang 时用英文：%s", en)
 	}
 	if strings.Contains(s, "gone<x>") || !strings.Contains(s, "gone&lt;x&gt;") {
 		t.Fatalf("路径应转义：%s", s)
@@ -164,5 +167,26 @@ func TestInjectKeepsOffsetsWithNonASCIIBeforeTags(t *testing.T) {
 	want := "İ<HEAD><base href=\"/asset/abc/\"><p>x</p><script type=\"module\" src=\"/static/review.js\" data-doc-review=\"html\"></script></BODY>"
 	if got != want {
 		t.Fatalf("got %s", got)
+	}
+}
+
+func TestReviewMarksSeen(t *testing.T) {
+	e := setup(t)
+	d, _ := e.st.Open(e.md, "s1")
+	if d.SeenAt != nil {
+		t.Fatalf("刚登记不应有 seenAt")
+	}
+	call(t, e, "GET", "/review?doc="+d.ID+"&t=tok", "", nil)
+	if got, _ := e.st.Get(d.ID); got.SeenAt == nil {
+		t.Fatalf("打开文档页后应记下 seenAt")
+	}
+}
+
+func TestRawMarksSeen(t *testing.T) {
+	e := setup(t)
+	d, _ := e.st.Open(e.md, "s1")
+	call(t, e, "GET", "/raw?doc="+d.ID+"&t=tok", "", nil)
+	if got, _ := e.st.Get(d.ID); got.SeenAt == nil {
+		t.Fatalf("md 页面取内容时应记下 seenAt")
 	}
 }

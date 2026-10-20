@@ -1,4 +1,4 @@
-// Package api 提供评审页和 mod 使用的 HTTP 接口。
+// Package api 提供文档页和插件使用的 HTTP 接口。
 package api
 
 import (
@@ -37,13 +37,10 @@ func New(cfg Config) http.Handler {
 	mux.HandleFunc("GET /api/doc", a.auth(a.doc))
 	mux.HandleFunc("GET /api/docs", a.auth(a.docs))
 	mux.HandleFunc("POST /api/comments", a.auth(a.addComment))
-	mux.HandleFunc("PATCH /api/comments", a.auth(a.updateComment))
 	mux.HandleFunc("DELETE /api/comments", a.auth(a.deleteComment))
-	mux.HandleFunc("POST /api/send", a.auth(a.send))
-	mux.HandleFunc("POST /api/approve", a.auth(a.approve))
-	mux.HandleFunc("GET /api/outbox", a.auth(a.outbox))
-	mux.HandleFunc("POST /api/outbox/ack", a.auth(a.ack))
-	mux.HandleFunc("POST /api/resolve", a.auth(a.resolve))
+	mux.HandleFunc("GET /api/replies", a.auth(a.replies))
+	mux.HandleFunc("DELETE /api/replies", a.auth(a.clearReplies))
+	mux.HandleFunc("POST /api/replies/sent", a.auth(a.markSent))
 	a.registerPages(mux)
 	return checkHost(cfg.BaseURL, mux)
 }
@@ -98,11 +95,19 @@ func (a *app) open(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) doc(w http.ResponseWriter, r *http.Request) {
-	d, err := a.cfg.Store.View(r.URL.Query().Get("doc"))
+	d, err := a.cfg.Store.Get(r.URL.Query().Get("doc"))
 	if err != nil {
 		fail(w, err)
 		return
 	}
+	// 文档页只画待发送的回复；已发送的保留在文件里，不再显示。
+	drafts := []store.Comment{}
+	for _, c := range d.Comments {
+		if c.Status == store.Draft {
+			drafts = append(drafts, c)
+		}
+	}
+	d.Comments = drafts
 	writeJSON(w, d)
 }
 
@@ -131,19 +136,6 @@ func (a *app) addComment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, c)
 }
 
-func (a *app) updateComment(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Doc, ID, Body string }
-	if !readJSON(w, r, &in) {
-		return
-	}
-	c, err := a.cfg.Store.UpdateComment(in.Doc, in.ID, in.Body)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	writeJSON(w, c)
-}
-
 func (a *app) deleteComment(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	if err := a.cfg.Store.DeleteComment(q.Get("doc"), q.Get("id")); err != nil {
@@ -153,64 +145,43 @@ func (a *app) deleteComment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-func (a *app) send(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Doc string }
-	if !readJSON(w, r, &in) {
-		return
-	}
-	b, err := a.cfg.Store.Send(in.Doc)
+func (a *app) replies(w http.ResponseWriter, r *http.Request) {
+	groups, err := a.cfg.Store.Replies(r.URL.Query().Get("session"))
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, b)
+	total := 0
+	for _, g := range groups {
+		total += len(g.Replies)
+	}
+	writeJSON(w, map[string]any{"groups": groups, "total": total})
 }
 
-func (a *app) approve(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Doc string }
-	if !readJSON(w, r, &in) {
-		return
-	}
-	b, err := a.cfg.Store.Approve(in.Doc)
+func (a *app) clearReplies(w http.ResponseWriter, r *http.Request) {
+	n, err := a.cfg.Store.ClearReplies(r.URL.Query().Get("session"))
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, b)
+	writeJSON(w, map[string]int{"deleted": n})
 }
 
-func (a *app) outbox(w http.ResponseWriter, r *http.Request) {
-	list, err := a.cfg.Store.Outbox(r.URL.Query().Get("session"))
+func (a *app) markSent(w http.ResponseWriter, r *http.Request) {
+	var in struct{ IDs []string }
+	if !readJSON(w, r, &in) {
+		return
+	}
+	if len(in.IDs) == 0 {
+		writeErr(w, http.StatusBadRequest, errors.New("ids 不能为空"))
+		return
+	}
+	n, missing, err := a.cfg.Store.MarkSent(in.IDs)
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, list)
-}
-
-func (a *app) ack(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Session, Batch string }
-	if !readJSON(w, r, &in) {
-		return
-	}
-	if err := a.cfg.Store.Ack(in.Session, in.Batch); err != nil {
-		fail(w, err)
-		return
-	}
-	writeJSON(w, map[string]bool{"ok": true})
-}
-
-func (a *app) resolve(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Items []store.ResolveItem }
-	if !readJSON(w, r, &in) {
-		return
-	}
-	n, missing, err := a.cfg.Store.Resolve(in.Items)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	out := map[string]any{"resolved": n}
+	out := map[string]any{"sent": n}
 	if len(missing) > 0 {
 		out["missing"] = missing
 	}
@@ -241,7 +212,7 @@ func fail(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFound), errors.Is(err, os.ErrNotExist):
 		writeErr(w, http.StatusNotFound, err)
-	case errors.Is(err, store.ErrNotDraft), errors.Is(err, store.ErrNoDrafts), errors.Is(err, store.ErrNotReady):
+	case errors.Is(err, store.ErrNotDraft):
 		writeErr(w, http.StatusConflict, err)
 	case errors.Is(err, store.ErrInvalid), errors.Is(err, store.ErrUnsupported):
 		writeErr(w, http.StatusBadRequest, err)

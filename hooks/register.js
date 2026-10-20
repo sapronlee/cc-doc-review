@@ -1,3 +1,5 @@
+import { atom, read, update } from 'claude-code'
+
 import { autoRegisterConfig, isMainLoopSuccess, isReviewDoc } from '../src/autoreg.js'
 import {
   assetName,
@@ -18,29 +20,7 @@ import {
   sha256Argv,
   versionOf,
 } from '../src/binary.js'
-import {
-  activeDocs,
-  baseName,
-  classifyDelivered,
-  copyFailReason,
-  nextReminder,
-  reminderPrompt,
-  reminderTitle,
-} from '../src/band.js'
-import { dataDirOf, isHealthy, messageOf, parseInfo, parseReply, reviewUrl, startArgv } from '../src/client.js'
-import {
-  contextText,
-  approvedToast,
-  approveQueuedToast,
-  deliveredToast,
-  isUserOrigin,
-  queuedToast,
-  remindedToast,
-  remindFailedToast,
-  reminderTargets,
-  retryDelay,
-} from '../src/delivery.js'
-import { commentIdsIn, formatBatch } from '../src/format.js'
+import { dataDirOf, isHealthy, messageOf, parseInfo, parseReply, reviewUrl, startArgv, withLang } from '../src/client.js'
 import {
   copyLegacyArgv,
   isLegacyCommand,
@@ -51,24 +31,28 @@ import {
   psArgv,
   shouldCopyLegacy,
 } from '../src/migrate.js'
-import { OPEN_SPEC, OPEN_TOOL, RESOLVE_SPEC, RESOLVE_TOOL, STATUS_SPEC, STATUS_TOOL } from '../src/rules.js'
-import { countsOf, openResult, statusResult } from '../src/status.js'
-import {
-  BAND_STATES,
-  bandDocs,
-  commentIcon,
-  dirOf,
-  displayName,
-  dividerLine,
-  fitDocs,
-  hasDrawnContent,
-  markdownLink,
-  MAX_ROWS,
-  stateDescription,
-  stateIcon,
-  stateOf,
-  visibleDocs,
-} from '../src/bandview.js'
+import { OPEN_SPEC, OPEN_TOOL, openText } from '../src/rules.js'
+import { docItems } from '../src/docsview.js'
+import { langOf, t } from '../src/i18n.js'
+import { isUserOrigin, parseMessage, withReplies } from '../src/reply.js'
+import { bandModel, COLLAPSED_ROWS, messageModel } from '../src/replylist.js'
+import { CANVAS_W, CLOSE_W, closeBaseSvg, COL, cornerEdgeSvg, docRowSvg, edgeSvg, frameSvg, gapSvg, HEAD_RIGHT, lineSvg, PAD, padSvg, RADIUS, ROW_H, rowSvg, sepSvg } from '../src/bandart.js'
+import { markdownLink } from '../src/bandview.js'
+
+/**
+ * 重画信号：桌面版只在绘制时读过的插件状态变了才重画输入框上方。回复区绘制时读它，需要重画时加一（见 redraw）。
+ * 正式安装的插件在 Claude 空闲时也会因此重画（设计文档 15.3）。
+ */
+const redraws = atom({ plugin: 'cc-doc-review', key: 'redraws' }, 0)
+
+/** 请回复区重画：写插件状态（桌面版据此重画），同时照旧 invalidate（终端据此重画）。画界面时调用无效，只在事件和定时器里调。@param {any} $ */
+function redraw($) {
+  $.ui.invalidate('ui.render')
+  update($, redraws, n => n + 1).catch(() => {})
+}
+
+/** 回车发出的消息记下完整内容时加一：聊天记录里的消息读它，记下后重画一次（按回车那一刻桌面版已经画过这条消息，那时还没记下）。*/
+const sentMarks = atom({ plugin: 'cc-doc-review', key: 'sentMarks' }, 0)
 
 /** 斜杠命令名：不能叫 review，会和内置的 /code-review 冲突。*/
 const COMMAND = 'cc-doc-review'
@@ -76,57 +60,25 @@ const COMMAND = 'cc-doc-review'
 const WRITE_TOOLS = ['Write', 'Edit']
 /** 自动登记失败（多半是服务起不来）后，这么久内不再尝试，免得每次写文档都等启动超时。*/
 const AUTO_BACKOFF_MS = 60_000
-/** 单次状态刷新卡住超过这么久，就当它已经结束。*/
-const REFRESH_STUCK_MS = 10_000
-/** 同一文档的〔打开评审页〕在这段时间内重复点击只算一次。*/
-const OPEN_AGAIN_MS = 10_000
-let isDelivering = false
-let hasWarned = false
-/** 投递定时器；会话重新开始时先取消旧的，避免叠加。@type {import('claude-code').Timer | undefined} */
-let deliverTimer
-/** 已送达（发进会话或附在用户消息上）但还没确认的批次 ID：确认失败时下一轮只重试确认，不重复发送。*/
-const submittedBatches = new Set()
-/** 发进会话失败的批次 → 已失败次数、下次重试的时间（$.clock.now() 的毫秒数）。@type {Map<string, { failures: number, nextAt: number }>} */
-const retries = new Map()
-/**
- * 重试用完、等着附在用户下一条消息上的批次：批次 ID → 排好的消息文字和其中的评论 ID。
- * @type {Map<string, { batch: string, text: string, ids: string[] }>}
- */
-const awaitingUser = new Map()
-/** 正附在用户消息上、那条消息还没进入的批次：投递定时器跳过它们，不另发；进入后转入 submittedBatches，被拒则回到 awaitingUser。*/
-const attaching = new Set()
-/** 已自动提醒过的批次：每批最多提醒一次，防止循环。*/
-const remindedBatches = new Set()
-
-// 状态带的数据。用模块变量加 $.ui.invalidate 重绘：热重载丢了也无妨，两秒内就重新取到。
-/** 状态带刷新定时器。@type {import('claude-code').Timer | undefined} */
-let statusTimer
-let isRefreshing = false
-let refreshStartedAt = 0
-/** 本会话的文档概况（GET /api/docs）；服务不在时为空。@type {import('../src/band.js').DocSummary[]} */
-let docs = []
-/** 会话的工作目录：卡片里按它显示文档的相对目录；取到之前显示绝对目录。*/
-let sessionCwd = ''
-/** 内层内容绘制失败的提示每个进程只弹一次。*/
-let hasWarnedInner = false
-/** 最近一次刷新状态的时刻（$.clock.now() 的毫秒数）：文档项里「N 分钟前更新」按它算。*/
-let bandNow = 0
-/** 服务地址和令牌（server.json）：状态带的文件链接按它拼评审页地址；服务不在时为空。@type {import('../src/client.js').ServerInfo | undefined} */
-let bandInfo
-let docsKey = '[]'
+/** 回复刷新定时器（每秒）。@type {import('claude-code').Timer | undefined} */
+let replyTimer
+let isFetchingReplies = false
+/** 本会话待发送的回复（GET /api/replies 的 groups）；服务不在时为空。@type {import('../src/reply.js').ReplyGroup[]} */
+let replies = []
+let repliesKey = '[]'
+/** 〔发送〕按下到发出（或失败）之间：按钮显示「发送中…」，再点无效；这期间按回车也不再带上同一批回复。*/
+let isSending = false
+/** 〔清空〕第一次按下的时刻（$.clock.now() 的毫秒数）；3 秒内再按才清空。@type {number | undefined} */
+let clearArmedAt
+/** 回复区展开着（超过 3 条时）。*/
 let isExpanded = false
-/**
- * 要送达的评论 ID → 所在文档、批次、是否已进入模型。
- * 带着它的「[文档评审]」消息真正开始一轮（turn.start），或随用户消息作为 context 进入，才算进入模型；一轮结束时只核对这些。
- * @type {Map<string, { doc: string, batch: string, isInModel: boolean }>}
- */
-const delivered = new Map()
-/** 提醒中的评论 ID（已送达、还没 review_resolve）。@type {string[]} */
-let reminder = []
-/** 点了〔×〕：下一批评论送达前不再提醒。*/
-let isReminderDismissed = false
-/** 每有新一批评论进入模型加一；核对期间变了，那次核对的结果作废。*/
-let reminderEpoch = 0
+/** 每次本地改动回复（删、发出）加一：改动前发出的取数结果作废，免得刚删的又冒出来。*/
+let repliesEpoch = 0
+/** 界面文字用哪套：会话开始时按 Claude Code 的 language 设置定。@type {import('../src/i18n.js').Lang} */
+let lang = 'en'
+
+/** 会话的工作目录：回复的来源说明按它显示文档的相对路径；取到之前现取。*/
+let sessionCwd = ''
 /** 本会话已自动登记过的文件，重复编辑不再登记、不再提示。*/
 const autoRegistered = new Set()
 let hasAutoWarned = false
@@ -146,8 +98,6 @@ let restartedFor
 let restartRetryAt = 0
 /** 正在自重启：同时来的调用先沿用旧服务，不重复重启。*/
 let isRestarting = false
-/** 各文档最近一次〔打开评审页〕的时刻（$.clock.now() 的毫秒数），按文档路径记。@type {Map<string, number>} */
-const openedAt = new Map()
 /** 自重启失败后多久内不再重试。*/
 const RESTART_BACKOFF_MS = 60_000
 /** 已就哪个插件版本提示过「继续使用旧版服务」，每个版本只提示一次。@type {string | undefined} */
@@ -157,8 +107,6 @@ let staleWarnedFor
 // 定时器只在 session.start 启动（引擎只保证从那里启动的定时器持续运行），休眠时每次 tick 只看标志就返回，不调用任何 $ 能力。
 // 用到评审（调用评审工具、用斜杠命令、自动登记命中、开始时本会话已有文档）才唤醒，保持到会话结束。
 let isAwake = false
-/** 刚唤醒：下一次投递 tick 顺带取一次状态，状态带不用等 2 秒。*/
-let isRefreshDue = false
 /** 每次复位为休眠加一；唤醒检查回来时会话已换（/clear），结果作废。*/
 let sessionEpoch = 0
 /** /resume 换到另一个会话后，下一轮开始时查一次那个会话有没有文档。*/
@@ -169,7 +117,7 @@ let isWakeCheckDue = false
  * 引擎实际给的工具全名（$.tool.register 的返回值）。前缀取自插件加载时的名字，
  * 不一定等于清单里的名字（比如会话进行中插件改了名、热重载后仍沿用旧名），所以不能写死。
  */
-const toolNames = { open: OPEN_TOOL, resolve: RESOLVE_TOOL, status: STATUS_TOOL }
+const toolNames = { open: OPEN_TOOL }
 
 /** 注册结果里的工具全名；拿不到像样的全名时用默认名。@param {any} registered @param {string} fallback */
 const fullToolName = (registered, fallback) => {
@@ -177,191 +125,247 @@ const fullToolName = (registered, fallback) => {
   return typeof tool === 'string' && tool.startsWith('mcp__') ? tool : fallback
 }
 
-/** review_open：登记文档并返回评审链接和卡片数据。@param {any} $ @param {any} e */
-async function reviewOpen($, e) {
+/** open_doc：登记文档，返回路径和文档页链接。@param {any} $ @param {any} e */
+async function openDocTool($, e) {
   try {
     const file = String(e.path ?? '')
     const opened = await openDoc($, file)
     const path = String(opened.doc?.path ?? (await absPath($, file)))
-    return { result: openResult({ url: String(opened.url), path, comments: opened.doc?.comments }, await $.session.cwd()) }
+    return { result: openText(path, withLang(String(opened.url), lang), String((await $.session.cwd()) ?? ''), lang) }
   } catch (err) {
-    return { deny: `review_open 失败：${messageOf(err)}` }
+    return { deny: `open_doc: ${messageOf(err)}` }
   } finally {
     wake()
   }
 }
 
-/** review_resolve：把评论标为已解决。@param {any} $ @param {any} e */
-async function reviewResolve($, e) {
-  try {
-    const items = Array.isArray(e.items) ? e.items : []
-    const { resolved, missing = [] } = await call($, 'POST', '/api/resolve', { items })
-    const done = `已标记 ${resolved} 条评论为已解决，评审页会自动更新。`
-    return { result: missing.length ? `${done}找不到这些评论 ID：${missing.join('、')}，请核对后重试。` : done }
-  } catch (err) {
-    return { deny: `review_resolve 失败：${messageOf(err)}` }
-  } finally {
-    wake()
-  }
-}
-
-/** review_status：本会话各文档的进度和待处理评论。@param {any} $ */
-async function reviewStatusTool($) {
-  try {
-    return { result: await reviewStatus($) }
-  } catch (err) {
-    return { deny: `review_status 失败：${messageOf(err)}` }
-  } finally {
-    wake()
-  }
-}
+/** 悬停时这一条的底色：浅色、深色主题上都是一层很淡的灰。*/
+const ROW_HOVER = 'rgba(127,127,127,0.10)'
 
 /**
- * 输入框上方状态带里本插件画的「文档评审」；没什么可显示时返回 undefined。
- * 列哪些文档：未发送、待确认、待评审、Claude 处理中四种状态，且 24 小时内有变化的（bandDocs），先排轮到你的。
- * 桌面版：一行靠左，「评审」后面是文件药丸。药丸左边的 lucide 图标形状表示状态、颜色表示轮到谁；
- * 文件名是链接，和下面的用量一样平铺不加框，点了在系统浏览器打开评审页（桌面版的链接一律走外部浏览器）；
- * 服务地址还没取到时退回原生按钮。放几个按宽度估算，其余收成「+N」。
- * 命令行版：标题行下每个文档一行文字，状态写成文字，带〔复制链接〕〔打开〕，超过 3 个可展开。
+ * 画回复列表（输入框上方的回复区和聊天记录里的回复消息共用，设计文档 15.2）：表格样式，圆角外框，
+ * 标题行（↩ N 条回复 · 文档名；回复区右边是〔展开其余 N 条〕〔清空〕〔发送〕），下面一条回复一行，行与行之间是通栏横线（单独一条，贯穿外框）。
+ * 桌面版：每一行（编号圆点、竖线、原文、回复）和横线是 src/bandart.js 画的图；标题行用桌面版的文字，和按钮对齐；
+ * 按钮是桌面版自己的（纯文字样式）；回复区鼠标停在某行上底色变浅、行尾出现 ×。
+ * 终端：没有图，画成文字（编号、│ 原文、回复）。
  * @param {any} $ @param {any} e
+ * @param {{ title: string, docName?: string, rows: import('../src/replylist.js').ListRow[], toggle?: string }} model
+ * @param {{ buttons?: any[], onDelete?: (r: { id: string, doc: string }) => void }} [opts]
  */
-function bandTree($, e) {
-  const { Box, Button, Markdown, Svg, Text } = $.ui.resolve(e)
-  const btn = (/** @type {string} */ key, /** @type {string} */ label, /** @type {(p: any) => unknown} */ onPress, extra = {}) =>
-    Button({
-      key,
-      label,
-      onPress: p => {
-        Promise.resolve()
-          .then(() => onPress(p))
-          .catch(err => $.ui.toast(`文档评审：${messageOf(err)}`))
-      },
-      ...extra,
-    })
-  const line = (/** @type {string} */ key, /** @type {any[]} */ children, extra = {}) =>
-    Box({ key, flexDirection: 'row', alignItems: 'center', columnGap: 1, children, ...extra })
-  const meta = (/** @type {any} */ doc) => BAND_STATES[/** @type {keyof typeof BAND_STATES} */ (stateOf(doc) ?? 'review')]
-
-  const listed = bandDocs(docs, bandNow)
-  const isReminding = reminder.length > 0 && !isReminderDismissed
-  if (listed.length === 0 && !isReminding) return undefined
-  const reminderLine = () =>
-    line('head', [
-      Box({ key: 'head-text', flexShrink: 1, children: [Text({ color: 'warning', bold: true, wrap: 'truncate-end', children: [reminderTitle(reminder.length)] })] }),
-      btn('dismiss', '×', () => dismissReminder($), { role: 'dismiss' }),
-    ])
-
-  if (e.surface === 'desktop') {
-    const pic = (/** @type {string} */ key, /** @type {{ svg: string, width: number }} */ p, /** @type {string} */ alt) =>
-      Svg({ key, source: p.svg, alt, width: p.width, height: 18 })
-    // 带 key 的盒子是悬停锚点；其中 absolute + display:none + hover 时 display:flex 的 Box 会被桌面版提成自带样式的悬浮卡片
-    const anchor = (/** @type {string} */ key, /** @type {any[]} */ body, /** @type {any[]} */ card) =>
+function replyList($, e, model, { buttons = [], onDelete } = {}) {
+  const { Box, Button, Svg, Text } = $.ui.resolve(e)
+  const isBand = onDelete !== undefined
+  const hasArt = e.surface === 'desktop' && Svg !== undefined
+  const art = (/** @type {string} */ key, /** @type {string} */ source, /** @type {string} */ alt, h = ROW_H) =>
+    Box({ key, flexGrow: 1, flexShrink: 1, minWidth: 0, overflow: 'hidden', children: [Svg({ source, alt, width: CANVAS_W, height: h })] })
+  const xButton = (/** @type {any} */ r) => Button({ key: `${r.key}:x`, label: '×', plain: true, dimColor: true, onPress: () => onDelete({ id: r.id, doc: r.doc }) })
+  // 鼠标停在这一行上才出现 ×，排在行尾；包着 × 的盒子不能带 key，否则悬停不传下去。
+  // 桌面版：× 那一格宽 CLOSE_W、和行一样高，× 居中；最底下一像素是图，最后一行画着外框下沿，× 出现时下沿不断
+  const close = (/** @type {any} */ r, isLast = false) =>
+    !isBand
+      ? []
+      : hasArt
+        ? [
+            Box({
+              display: 'none',
+              hover: { display: 'flex' },
+              flexDirection: 'column',
+              flexShrink: 0,
+              children: [
+                Box({ flexGrow: 1, alignItems: 'center', justifyContent: 'center', children: [xButton(r)] }),
+                Svg({ source: closeBaseSvg(isLast), alt: '边框', width: CLOSE_W, height: 1 }),
+              ],
+            }),
+          ]
+        : [Box({ display: 'none', hover: { display: 'flex' }, flexShrink: 0, children: [xButton(r)] })]
+  // 行尾的空白（PAD 宽）：长回复不贴着右边框截断；回复区的 × 那一格出现在它和右边框之间，位置不变
+  const pad = (isLast = false) => [Box({ flexShrink: 0, children: [Svg({ source: padSvg(isLast), alt: '边框', width: PAD, height: ROW_H })] })]
+  // 竖着的边框小图：右边框（宽 1），标题行的左边框加内边距（宽 PAD + 1）
+  const edge = (/** @type {string} */ key, /** @type {number} */ h, w = 1, /** @type {'left' | 'right'} */ side = 'right') =>
+    hasArt ? [Box({ key, flexShrink: 0, children: [Svg({ source: edgeSvg(h, w, side), alt: '边框', width: w, height: h })] })] : []
+  // 标题行全用桌面版的文字和按钮（同一种字体），和右边的按钮同一条基线；左边和下面每行的编号圆点对齐
+  const head = Box({
+    key: 'head',
+    flexDirection: 'row',
+    alignItems: 'center',
+    children: [
+      ...edge('head:l', ROW_H, PAD + 1, 'left'),
       Box({
-        key,
-        flexDirection: 'row',
-        alignItems: 'center',
-        flexShrink: 0,
-        children: [...body, Box({ position: 'absolute', display: 'none', hover: { display: 'flex' }, flexDirection: 'column', rowGap: 1, children: card })],
-      })
-    // 文件：状态图标在文件名链接左边，隔一格，免得和链接的颜色连成一片
-    const pill = (/** @type {string} */ key, /** @type {any} */ doc) =>
-      Box({
-        key: `pill-${key}`,
+        key: 'title',
+        flexGrow: 1,
+        flexShrink: 1,
+        minWidth: 0,
         flexDirection: 'row',
         alignItems: 'center',
         columnGap: 1,
-        flexShrink: 0,
         children: [
-          pic(`${key}:icon`, stateIcon(stateOf(doc) ?? 'review'), meta(doc).label),
-          bandInfo
-            ? Markdown({ key: `link:${doc.id}`, text: markdownLink(displayName(doc.path), reviewUrl(bandInfo, doc.id)) })
-            : btn(key, displayName(doc.path), () => openReview($, doc), meta(doc).turn === 'wait' ? { dimColor: true } : {}),
+          Text({ color: 'claude', children: ['↩'] }),
+          Text({ bold: true, children: [model.title] }),
+          ...(model.docName ? [Text({ dimColor: true, wrap: 'truncate-end', children: [`· ${model.docName}`] })] : []),
         ],
-      })
-    // 「评审」卡片：标题、文档数，下面是图例（每种状态一行：图标、名称、篇数，只列不为 0 的）
-    const legend = Object.keys(BAND_STATES).flatMap(state => {
-      const n = listed.filter(d => stateOf(d) === state).length
-      if (n === 0) return []
-      const m = BAND_STATES[/** @type {keyof typeof BAND_STATES} */ (state)]
-      return [
-        line(`legend:${state}`, [
-          pic(`legend-icon:${state}`, stateIcon(state), m.label),
-          Text({ key: `legend-label:${state}`, children: [m.label] }),
-          Box({ key: `legend-gap:${state}`, flexGrow: 1, minWidth: 2 }),
-          Text({ key: `legend-n:${state}`, dimColor: true, children: [`${n} 篇`] }),
-        ]),
-      ]
+      }),
+      ...buttons,
+      ...edge('head:r', ROW_H, HEAD_RIGHT + 1),
+    ],
+  })
+  // 外框的上沿、下沿：左圆角加很宽的横线（右边被裁）、右圆角小图
+  // 空白边（gap:head）：和上沿一样高，只有左右边框，垫在标题行下面让它上下居中
+  const rim = (/** @type {'top' | 'gap:head'} */ side) => {
+    const f = side === 'top' ? frameSvg('top') : gapSvg()
+    const key = side.startsWith('gap:') ? side : `rim:${side}`
+    return Box({
+      key,
+      flexDirection: 'row',
+      children: [
+        Box({ key: `${key}:l`, flexGrow: 1, flexShrink: 1, minWidth: 0, overflow: 'hidden', children: [Svg({ source: f.left, alt: '边框', width: CANVAS_W, height: RADIUS })] }),
+        Box({ key: `${key}:r`, flexShrink: 0, children: [Svg({ source: f.right, alt: '边框', width: RADIUS, height: RADIUS })] }),
+      ],
     })
-    const head = isReminding
-      ? reminderLine()
-      : anchor(
-          'seg:head',
-          [pic('head-icon', commentIcon(), '文档评审'), Text({ key: 'head-label', color: 'claude', children: [' 评审'] })],
-          [
-            Box({
-              key: 'head-card-top',
-              flexDirection: 'column',
-              children: [
-                Text({ key: 'head-title', bold: true, children: ['文档评审'] }),
-                Text({ key: 'head-sum', dimColor: true, children: [`${listed.length} 个文档`] }),
-              ],
-            }),
-            Box({ key: 'legend', flexDirection: 'column', children: legend }),
-          ],
-        )
-    const { shown, hidden } = fitDocs(listed, e.props?.bodyColumns)
-    const pills = shown.map(doc =>
-      anchor(
-        `seg:${doc.id}`,
-        [pill(`open:${doc.id}`, doc)],
-        [
-          // 文件卡片只留：全名，和「状态 · 目录 · N 分钟前更新」
-          Text({ key: `name:${doc.id}`, bold: true, children: [baseName(doc.path)] }),
-          Text({ key: `desc:${doc.id}`, dimColor: true, children: [stateDescription(doc, sessionCwd, bandNow)] }),
-        ],
-      ),
-    )
-    const more =
-      hidden > 0
-        ? [
-            anchor(
-              'seg:more',
-              [Text({ key: 'more-label', dimColor: true, children: [`+${hidden}`] })],
-              listed.slice(shown.length).map(doc => pill(`open:${doc.id}`, doc)),
-            ),
-          ]
-        : []
-    // 不加左右内边距：桌面版外层容器本身有内边距，再加一层会把内容往中间挤
-    return Box({ key: 'band', width: '100%', flexDirection: 'row', justifyContent: 'flex-start', alignItems: 'center', columnGap: 2, children: [head, ...pills, ...more] })
   }
-
-  const { shown, hidden } = visibleDocs(listed, isExpanded)
-  const head = isReminding
-    ? reminderLine()
-    : line('head', [
-        Text({ key: 'head-title', bold: true, children: ['文档评审'] }),
-        Text({ key: 'head-sum', dimColor: true, wrap: 'truncate-end', children: [`${listed.length} 个文档`] }),
-      ])
-  const items = shown.map(doc =>
-    line(`doc:${doc.id}`, [
-      Text({ key: `icon:${doc.id}`, dimColor: true, children: ['•'] }),
-      Text({ key: `name:${doc.id}`, bold: true, wrap: 'truncate-end', children: [baseName(doc.path)] }),
-      Box({ key: `dir:${doc.id}`, flexGrow: 1, flexShrink: 1, children: [Text({ dimColor: true, wrap: 'truncate-middle', children: [dirOf(doc.path, sessionCwd)] })] }),
-      Text({ key: `state:${doc.id}`, color: meta(doc).turn === 'you' ? 'claude' : undefined, dimColor: meta(doc).turn !== 'you', children: [meta(doc).label] }),
-      btn(`copy:${doc.id}`, '复制链接', p => copyLink($, doc, p.surface)),
-      btn(`open:${doc.id}`, '打开', () => openReview($, doc)),
-    ]),
-  )
-  const more =
-    listed.length > MAX_ROWS
+  // 行与行之间的横线：单独一条通栏，贯穿外框（终端不画）
+  const line = (/** @type {string} */ key) =>
+    hasArt ? [Box({ key, width: '100%', overflow: 'hidden', children: [Svg({ source: lineSvg(), alt: '分隔线', width: CANVAS_W, height: 1 })] })] : []
+  /** 行尾的右边框，每行都宽 RADIUS（竖线贴右边），× 那一格各行对齐：最后一行带右下圆角。@param {string} key @param {boolean} isLast */
+  const rightEdge = (key, isLast) =>
+    hasArt && isLast ? [Box({ key, flexShrink: 0, children: [Svg({ source: cornerEdgeSvg(ROW_H), alt: '边框', width: RADIUS, height: ROW_H })] })] : edge(key, ROW_H, RADIUS)
+  // 每行都是「横线 + 一行」两张图：最后一行把外框下沿、两个下圆角画在自己的图里，不另加下沿，各行一样高
+  const rows = model.rows.flatMap((r, i) => [...line(`line:${r.key}`), rowOf(r, i === model.rows.length - 1)])
+  /** @param {import('../src/replylist.js').ListRow} r @param {boolean} isLast */
+  function rowOf(r, isLast) {
+    if (r.kind === 'doc') {
+      return hasArt
+        ? Box({ key: r.key, flexDirection: 'row', children: [art(`${r.key}:art`, docRowSvg(r.name, ROW_H, isLast), r.name), ...rightEdge(`${r.key}:r`, isLast)] })
+        : Text({ key: r.key, dimColor: true, bold: true, wrap: 'truncate-end', children: [r.name] })
+    }
+    // 桌面版：编号、原文画在图里（定宽）；回复用桌面版的文字，按实际行宽截断、末尾加「…」，底下垫一像素的图（最后一行是外框下沿）
+    const content = hasArt
       ? [
-          line('more', [
-            Text({ key: 'more-text', dimColor: true, children: [isExpanded ? `共 ${listed.length} 个文档` : `还有 ${hidden} 个文档`] }),
-            btn('toggle', isExpanded ? '收起' : '展开', () => toggleList($)),
-          ]),
+          Box({
+            key: `${r.key}:art`,
+            flexShrink: 0,
+            overflow: 'hidden',
+            children: [Svg({ source: rowSvg({ ...r, body: '' }, ROW_H, isLast), alt: `${r.no} ${r.fullQuote} ${r.body}`, width: COL.body, height: ROW_H })],
+          }),
+          Box({
+            key: `${r.key}:b`,
+            flexGrow: 1,
+            flexShrink: 1,
+            minWidth: 0,
+            flexDirection: 'column',
+            children: [
+              Box({ flexGrow: 1, minWidth: 0, flexDirection: 'column', justifyContent: 'center', alignItems: 'flex-start', children: [Text({ bold: true, wrap: 'truncate-end', children: [r.body.replace(/\s+/g, ' ')] })] }),
+              Box({ overflow: 'hidden', children: [Svg({ source: closeBaseSvg(isLast, CANVAS_W), alt: '边框', width: CANVAS_W, height: 1 })] }),
+            ],
+          }),
         ]
-      : []
-  return Box({ key: 'band', width: '100%', flexDirection: 'column', children: [head, ...items, ...more] })
+      : [
+          Box({ key: `${r.key}:no`, width: 3, flexShrink: 0, children: [Text({ color: 'claude', bold: true, children: [String(r.no)] })] }),
+          Box({ key: `${r.key}:q`, width: 30, flexShrink: 0, overflow: 'hidden', children: [Text({ dimColor: true, wrap: 'truncate-end', children: [`│ ${r.quote}`] })] }),
+          Box({ key: `${r.key}:b`, flexGrow: 1, flexShrink: 1, minWidth: 0, children: [Text({ wrap: isBand ? 'truncate-end' : 'wrap', children: [r.body] })] }),
+          ...close(r),
+        ]
+    return Box({
+      key: r.key,
+      flexDirection: 'row',
+      // 桌面版各格和行一样高（× 那一格的下沿贴着行底）；终端居中
+      alignItems: hasArt ? 'stretch' : 'center',
+      columnGap: hasArt ? 0 : 1,
+      ...(isBand ? { hover: { backgroundColor: ROW_HOVER } } : {}),
+      children: [...content, ...(hasArt ? [...pad(isLast), ...close(r, isLast)] : []), ...rightEdge(`${r.key}:r`, isLast)],
+    })
+  }
+  // 桌面版的外框自己画（上沿、下沿、左右边框都是图），内边距、对齐按像素定；终端用自带的圆角边框
+  // 行与行之间不留空：桌面版在纵向排列的子元素之间默认会空出一点，会让各行看起来不一样高
+  if (hasArt) return Box({ key: 'reply-list', flexDirection: 'column', rowGap: 0, children: [rim('top'), head, rim('gap:head'), ...rows] })
+  return Box({ key: 'reply-list', flexDirection: 'column', borderStyle: 'round', borderDimColor: true, children: [head, ...rows] })
+}
+
+/** 回复区自己以外要留出的行数：外层插件（如用量带）的内容画在回复区下面，回复区的钩子看不到它有多高，先按 3 行留。*/
+const RESERVED_ROWS = 3
+
+/**
+ * 一棵树大约占几行（按终端的算法：纵向排的子节点相加，横向排的取最高，带边框的加 2）。
+ * 用来算下层内容（本插件之后的插件画的）占了多少，回复区只用剩下的。
+ * @param {any} node @returns {number}
+ */
+function rowsOf(node) {
+  if (node === null || node === undefined || typeof node !== 'object') return 0
+  if (Array.isArray(node)) return node.reduce((n, c) => n + rowsOf(c), 0)
+  const props = node.props ?? {}
+  if (props.display === 'none' || props.position === 'absolute') return 0
+  if (node.type === 'Text' || node.type === 'Button' || node.type === 'Svg') return 1
+  const kids = (node.children ?? []).filter((/** @type {any} */ c) => c && typeof c === 'object')
+  const isRow = props.flexDirection === 'row' || props.flexDirection === 'row-reverse'
+  const inner = isRow ? Math.max(0, ...kids.map(rowsOf)) : kids.reduce((/** @type {number} */ n, /** @type {any} */ c) => n + rowsOf(c), 0)
+  const height = typeof props.height === 'number' ? props.height : inner
+  return height + (props.borderStyle ? 2 : 0)
+}
+
+/**
+ * 输入框上方的回复区：有待发送的回复时画表格，没有时返回 undefined（整块让给下层）。
+ * 条数按剩余高度定：这一块最多 maxRows 行，减去下层内容、外层留的行和自己的外框、标题行，剩下几行就最多列几条。
+ * @param {any} $ @param {any} e @param {number} now @param {number} [belowRows] 下层内容占的行数
+ */
+function replyBand($, e, now, belowRows = 0) {
+  const maxRows = typeof e.props?.maxRows === 'number' ? e.props.maxRows : 20
+  const room = maxRows - belowRows - RESERVED_ROWS - 3
+  const model = bandModel(replies, { isExpanded, isArmed: clearState(now, clearArmedAt) === 'armed', isSending, lang, room })
+  if (model.total === 0) return undefined
+  const { Box, Button, Svg } = $.ui.resolve(e)
+  const fail = (/** @type {unknown} */ err) => $.ui.toast(messageOf(err))
+  const hasArt = e.surface === 'desktop' && Svg !== undefined
+  const buttons = [
+    ...(model.toggle
+      ? [
+          Button({ key: 'toggle', label: model.toggle, plain: true, dimColor: true, onPress: () => toggleList($) }),
+          ...(hasArt ? [Box({ key: 'sep', flexShrink: 0, children: [Svg({ source: sepSvg(), alt: '|', width: 1, height: 12 })] })] : []),
+        ]
+      : []),
+    Button({ key: 'clear', label: model.clear, plain: true, dimColor: true, onPress: () => void pressClear($).catch(fail) }),
+    Button({ key: 'send', label: model.send, plain: true, ...(model.isSending ? { dimColor: true } : {}), onPress: () => void sendReplies($).catch(fail) }),
+  ]
+  return replyList($, e, model, { buttons, onDelete: r => void deleteReply($, r).catch(fail) })
+}
+
+/** 回车发出的消息：你打的原文（去掉首尾空白）→ 带回复块的完整消息，最多记 50 条（桌面版聊天记录显示的是原文）。*/
+const sentTexts = new Map()
+/** @param {string} typed @param {string} full */
+/** 消息没发出去：撤掉 rememberSent 记下的这一条（只撤自己记的那条）。@param {string} typed @param {string} full */
+function forgetSent(typed, full) {
+  const key = typed.trim()
+  if (sentTexts.get(key) === full) sentTexts.delete(key)
+}
+
+function rememberSent(typed, full) {
+  const key = typed.trim()
+  if (!key) return
+  sentTexts.delete(key)
+  sentTexts.set(key, full)
+  if (sentTexts.size > 50) sentTexts.delete(sentTexts.keys().next().value)
+}
+
+/**
+ * 聊天记录里带回复块的消息：画成和回复区一样的列表，你写的话放在下面；认不出回复块时返回 undefined（原样显示）。
+ * 折叠视图画成一行「N 条回复 · 你写的话的开头」。
+ * @param {any} $ @param {any} e
+ */
+function replyMessage($, e) {
+  const text = e.props?.text
+  const parsed = parseMessage(text) ?? parseMessage(sentTexts.get(String(text ?? '').trim()))
+  if (!parsed) return undefined
+  const { Box, Text } = $.ui.resolve(e)
+  const model = messageModel(parsed, parsed.lang)
+  if (e.props.isExpanded === false) {
+    const ownLine = model.own.split('\n')[0]
+    return Text({ key: 'reply-msg', dimColor: true, wrap: 'truncate-end', children: [ownLine ? `${model.title} · ${ownLine}` : model.title] })
+  }
+  const own = model.own ? [Text({ key: 'own', children: [model.own] })] : []
+  return Box({ key: 'reply-msg', flexDirection: 'column', rowGap: 1, children: [replyList($, e, model), ...own] })
+}
+
+/** 〔清空〕要点两次：第一次之后 3 秒内为 armed（按钮显示「确认清空」），过了就回到 idle。@param {number} now @param {number | undefined} armedAt */
+function clearState(now, armedAt) {
+  return armedAt !== undefined && now - armedAt < 3000 ? 'armed' : 'idle'
 }
 
 /** @type {import('claude-code').Register} */
@@ -369,39 +373,30 @@ export const register = (on, options) => {
   const auto = autoRegisterConfig(options)
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    goDormant($)
+    goDormant()
     needsWakeCheck = false
     isWakeCheckDue = false
     toolNames.open = fullToolName(await $.tool.register(OPEN_SPEC), OPEN_TOOL)
-    toolNames.resolve = fullToolName(await $.tool.register(RESOLVE_SPEC), RESOLVE_TOOL)
-    toolNames.status = fullToolName(await $.tool.register(STATUS_SPEC), STATUS_TOOL)
-    // 定时器一律在这里启动；休眠时空转（只看标志），唤醒后才投递、刷新状态
-    deliverTimer?.cancel()
-    deliverTimer = $.clock.every(1000, () => {
+    try {
+      lang = langOf(await $.config.list())
+    } catch {
+      lang = 'en'
+    }
+    // 定时器一律在这里启动；休眠时空转（只看标志），唤醒后才取回复
+    replyTimer?.cancel()
+    replyTimer = $.clock.every(1000, () => {
       if (isWakeCheckDue) {
         isWakeCheckDue = false
         void checkWake($).catch(() => {})
       }
       if (!isAwake) return
-      if (isRefreshDue) {
-        isRefreshDue = false
-        void refreshStatus($)
-      }
-      void deliver($)
-    })
-    statusTimer?.cancel()
-    statusTimer = $.clock.every(2000, () => {
-      if (isAwake) void refreshStatus($)
+      void refreshReplies($)
     })
     // 命令放在最后，且失败不抛：名字被引擎拒绝时也不能让工具和投递跟着失效。
     try {
-      await $.command.register({
-        name: COMMAND,
-        description: '在右侧浏览器面板打开文档评审页',
-        argumentHint: '<md 或 html 文件>',
-      })
+      await $.command.register({ name: COMMAND, description: t(lang, 'commandHint'), argumentHint: t(lang, 'commandArg') })
     } catch (err) {
-      $.ui.toast(`文档评审：/${COMMAND} 命令注册失败（${messageOf(err)}），评审工具不受影响`)
+      $.ui.toast(t(lang, 'commandFailed', { command: `/${COMMAND}`, reason: messageOf(err) }))
     }
     // 在后台查：服务卡住也不拖住会话开始
     void checkWake($).catch(() => {})
@@ -412,78 +407,66 @@ export const register = (on, options) => {
   // 所以定时器留着空转（等再次唤醒）；真正退出时定时器随进程一起消失，不用专门取消。
   // /clear 后是全新的会话，不用查；/resume 换来的会话可能登记过文档，下一轮开始时查一次。
   on('session.end', async ($, e, next) => {
-    goDormant($)
+    goDormant()
+    // 已经画在屏幕上的回复区马上收起
+    redraw($)
     needsWakeCheck = e.reason === 'resume'
     return next(e)
   })
 
   // 按注册时拿到的真实工具名分派；不是本插件的工具原样放行
   on('tool.call', async ($, e, next) => {
-    if (e.tool === toolNames.open) return reviewOpen($, e)
-    if (e.tool === toolNames.resolve) return reviewResolve($, e)
-    if (e.tool === toolNames.status) return reviewStatusTool($)
+    if (e.tool === toolNames.open) return openDocTool($, e)
     return next(e)
   })
 
-  // 重试用完的评论附在用户的下一条消息上（context），只挂在用户自己发的消息上；休眠时直接放行。
+  // 你自己发消息时，把待发送的回复写进这条消息的正文（你的话在前，回复块在后）；消息交出去后标为已发送。
+  // 插件、通知等别的来源和斜杠命令不带；休眠、没有回复、或〔发送〕正在发这批回复时原样放行（免得发两遍）。
   on('prompt.submit', async ($, e, next) => {
-    if (!isAwake || awaitingUser.size === 0 || !isUserOrigin(e.origin)) return next(e)
-    const waiting = [...awaitingUser.values()]
-    // 移出队列的同时标为送达中（中间没有 await）：next 挂起期间投递定时器不会把这批再发一遍
-    awaitingUser.clear()
-    for (const w of waiting) attaching.add(w.batch)
-    const epoch = sessionEpoch
-    const putBack = () => {
-      if (epoch !== sessionEpoch) return
-      for (const w of waiting) {
-        attaching.delete(w.batch)
-        if (!awaitingUser.has(w.batch)) awaitingUser.set(w.batch, w)
-      }
-    }
-    /** @type {import('claude-code').PromptSubmitResult} */
-    let r
+    if (!isAwake || isSending || replies.length === 0 || !isUserOrigin(e.origin) || e.text.trimStart().startsWith('/')) return next(e)
+    const sending = replies
+    const cwd = sessionCwd || String((await $.session.cwd()) ?? '')
+    const full = withReplies(e.text, sending, lang, cwd)
+    // 桌面版聊天记录里这条消息显示的是你打的原文（不带回复块）：记下原文对应的完整消息，聊天记录据此画回复卡片
+    rememberSent(e.text, full)
+    $.ui.invalidate('ui.render')
+    update($, sentMarks, n => n + 1).catch(() => {})
+    // 发出去、标为已发送之前，再按回车或点〔发送〕都不再带这批回复
+    isSending = true
     try {
-      r = await next({ ...e, context: [...(e.context ?? []), contextText(waiting.map(w => w.text))] })
-    } catch (err) {
-      putBack()
-      throw err
-    }
-    if (r.drop !== undefined) {
-      putBack()
+      const r = await next({ ...e, text: full })
+      if (r.drop === undefined) {
+        // 消息交出去后桌面版才画好这一行：再重画一次，卡片马上出来，不用等下一次刷新
+        $.ui.invalidate('ui.render')
+        update($, sentMarks, n => n + 1).catch(() => {})
+        await markSent($, sending)
+      }
+      else forgetSent(e.text, full)
       return r
+    } catch (err) {
+      forgetSent(e.text, full)
+      throw err
+    } finally {
+      isSending = false
     }
-    if (epoch !== sessionEpoch) return r
-    // 已随用户的消息进入模型（空闲时这一轮已开始；打字时有一轮在跑，就并进那一轮）。
-    // 确认送达交给投递定时器（下一次 tick），确认只在那一处做，不会和它并发。
-    const ids = waiting.flatMap(w => w.ids)
-    for (const w of waiting) {
-      attaching.delete(w.batch)
-      submittedBatches.add(w.batch)
-    }
-    markInModel($, ids)
-    // 只附了「通过」通知（没有评论）时不报「已收到 0 条评论」
-    if (ids.length > 0) $.ui.toast(deliveredToast(ids.length))
-    return r
   })
 
+  // 不带参数：在聊天里列出本会话的文档（名称是文档页链接）。带文件：登记并在系统浏览器打开。
   on('command.run', { command: COMMAND }, async ($, e) => {
     try {
       const file = e.args.trim()
-      if (!file) return { text: `用法：/${COMMAND} <md 或 html 文件>` }
-      const { url } = await openDoc($, file)
-      // 直接打开；打不开再请 Claude 在浏览器面板打开
-      const how = await openUrl($, url)
-      if (!how) $.prompt.submit({ text: `请在浏览器面板打开文档评审页：${url}` }).catch(() => {})
-      const where = how === 'panel' ? '，已在浏览器面板打开' : how === 'browser' ? '，已在系统浏览器打开' : ''
-      return { text: `已登记 ${file}${where}，评审页：${url}` }
+      if (!file) return { text: await listDocs($) }
+      const opened = await openDoc($, file)
+      const url = withLang(String(opened.url), lang)
+      return { text: t(lang, (await openInBrowser($, url)) ? 'cmdOpened' : 'cmdRegistered', { file, url }) }
     } catch (err) {
-      return { text: `打开失败：${messageOf(err)}` }
+      return { text: t(lang, 'cmdFailed', { reason: messageOf(err) }) }
     } finally {
       wake()
     }
   })
 
-  // 带评论的「[文档评审]」消息开始一轮：这批评论才算进入模型。
+  // /resume 换来的会话：第一轮开始时查一次那个会话有没有文档。
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
     if (/** @type {any} */ (e).agentId) return started
@@ -491,18 +474,40 @@ export const register = (on, options) => {
       needsWakeCheck = false
       isWakeCheckDue = true
     }
-    if (e.text.startsWith('[文档评审]')) markInModel($, commentIdsIn(e.text))
     return started
   })
 
-  // 一轮正常答完时核对进入模型的评论是否都回复了处理结果；子代理、被中断或出错的轮次不算。
-  // 在后台核对，不拖住这一轮的收尾。休眠时直接放行。
-  on('turn.complete', async ($, e, next) => {
-    const done = await next(e)
-    if (isAwake && !e.agentId && !e.isAborted && e.reason === 'answer') {
-      void checkUnreplied($).catch(() => {})
+  // 聊天记录里你发出的带回复块的消息：画成和回复区一样的列表。不需要唤醒：只看消息正文。
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    await read($, sentMarks)
+    const mine = replyMessage($, e)
+    return mine === undefined ? next(e) : mine
+  })
+
+  // 输入框上方的回复区。同一位置可能还有别的插件（如用量带）：自己画完把下层的内容接在下面，不独占这一块
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    await read($, redraws)
+    if (!isAwake || e.props.hasSurvey) return next(e)
+    if (replies.length === 0) return next(e)
+    let rest
+    /** @type {unknown} */
+    let failure
+    try {
+      rest = await next(e)
+    } catch (err) {
+      // 下层（别的插件或引擎）出错不能连累回复区：只画回复区
+      failure = err
     }
-    return done
+    const mine = replyBand($, e, await $.clock.now(), rowsOf(rest))
+    if (mine === undefined) {
+      if (failure !== undefined) throw failure
+      return rest
+    }
+    if (rest === null || rest === undefined) return mine
+    const { Box } = $.ui.resolve(e)
+    // 下层内容里可能有引擎自己的节点，不能放在设了 width 的 Box 下面：包着它们的盒子都不设宽度，靠纵向拉伸铺满
+    const stretch = { flexDirection: 'column', alignItems: 'stretch' }
+    return Box({ key: 'stack', ...stretch, children: [Box({ key: 'mine', ...stretch, children: [mine] }), Box({ key: 'rest', ...stretch, children: [rest] })] })
   })
 
   // 主对话写的文档命中配置的 glob 模式（默认 specs / plans / docs 下的 md、html）就自动登记评审；开关关掉则不挂钩。
@@ -518,96 +523,168 @@ export const register = (on, options) => {
       })
     }
   }
-
-  // 同一位置可能还有别的插件（如用量带）：自己画完也把下层的内容接在下面，不独占这一块
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (!isAwake || e.props.hasSurvey) return next(e)
-    const mine = bandTree($, e)
-    if (mine === undefined) return next(e)
-    // 内层（别的插件或引擎）出错不能连累本插件：只画自己这一行，并提示一次原因
-    let rest
-    try {
-      rest = await next(e)
-    } catch (err) {
-      if (!hasWarnedInner) {
-        hasWarnedInner = true
-        $.ui.toast(`文档评审：同一位置的其他插件绘制失败，已跳过（${messageOf(err)}）`)
-      }
-      return mine
-    }
-    if (rest === null || rest === undefined) return mine
-    const { Box, Svg } = $.ui.resolve(e)
-    // 下层内容里可能有引擎自己的节点，而引擎节点不能放在设了 width 的 Box 下面（整块会被拒绝）。
-    // 所以包着下层内容的 stack、rest 都不设宽度，靠纵向排列的拉伸铺满；只有自己画的部分设 width。
-    const stretch = { flexDirection: 'column', alignItems: 'stretch' }
-    const own = Box({ key: 'mine', width: '100%', children: [mine] })
-    const below = Box({ key: 'rest', ...stretch, children: [rest] })
-    if (e.surface !== 'desktop') return Box({ key: 'stack', ...stretch, children: [own, below] })
-    // 分隔线只在上下两块都有可见内容时画：下层只有引擎节点（看起来是空的）时不画
-    if (!hasDrawnContent(rest)) return Box({ key: 'stack', ...stretch, children: [own, below] })
-    const line = dividerLine()
-    const divider = Box({ key: 'divider', width: '100%', overflow: 'hidden', children: [Svg({ source: line.svg, alt: '分隔线', width: line.width, height: line.height })] })
-    return Box({ key: 'stack', ...stretch, children: [own, divider, below] })
-  })
 }
 
 /**
- * 发进会话，不再填进输入框兜底。在那一轮开始时才返回。
+ * 本会话的文档，每份一行 Markdown：「- [名称](链接) · 目录 · 时间」，有待发送回复时再接「 · N 条回复待发送」。
+ * 需要时启动服务；服务起不来返回「打开失败」。
  * @param {any} $
- * @param {string} text
- * @param {boolean} [asUser] 以用户的话发出（评论是用户写的）；否则以插件的名义
- * @returns {Promise<boolean>} 是否发进了会话（被拒或出错为 false）
+ * @returns {Promise<string>}
  */
-async function submitPrompt($, text, asUser = false) {
-  try {
-    const r = await $.prompt.submit(asUser ? { text, asUser: true } : { text })
-    return r.drop === undefined
-  } catch {
-    return false
-  }
-}
-
-/**
- * 每 2 秒：取本会话的文档概况，变了就重绘状态带；提醒中时顺带看那些评论回复了没有。
- * 服务不在就当没有数据，不去启动它。
- * @param {any} $
- */
-async function refreshStatus($) {
-  const now = await $.clock.now()
-  // 上一次刷新卡住（服务半死不活）超过 10 秒就不再等它
-  if (isRefreshing && now - refreshStartedAt < REFRESH_STUCK_MS) return
-  isRefreshing = true
-  refreshStartedAt = now
-  // 「N 分钟前」每过一分钟重画一次；其余时候数据不变就不重画（桌面版每次重画都会闪一下）
-  const isNewMinute = Math.floor(now / 60_000) !== Math.floor(bandNow / 60_000)
-  bandNow = now
-  if (isNewMinute) $.ui.invalidate('ui.render')
-  const epoch = sessionEpoch
+async function listDocs($) {
+  let list
+  let info
   try {
     const session = await $.session.id()
-    if (!sessionCwd) sessionCwd = String((await $.session.cwd()) ?? '')
-    const info = await readInfo($)
-    if (info?.port !== bandInfo?.port || info?.token !== bandInfo?.token) {
-      bandInfo = info
-      $.ui.invalidate('ui.render')
-    }
-    const list = await call($, 'GET', `/api/docs?session=${encodeURIComponent(session)}`, undefined, false)
-    // 取的过程中会话结束了：这是上一个会话的数据，丢掉
-    if (epoch !== sessionEpoch) return
-    setDocs($, Array.isArray(list) ? list : [])
-    if (reminder.length > 0) {
-      // 去掉已解决或已不存在的；一时查不到的（服务重启中）继续提醒
-      const before = reminder
-      const epoch = reminderEpoch
-      const { pending, settled, unknown } = await lookupDelivered($, before)
-      for (const id of settled) delivered.delete(id)
-      if (epoch === reminderEpoch) setReminder($, nextReminder(pending, unknown, reminder))
-    }
-  } catch {
-    if (epoch === sessionEpoch) setDocs($, [])
-  } finally {
-    isRefreshing = false
+    list = await call($, 'GET', `/api/docs?session=${encodeURIComponent(session)}`, undefined, true)
+    info = await readInfo($)
+  } catch (err) {
+    return t(lang, 'cmdFailed', { reason: messageOf(err) })
   }
+  const cwd = sessionCwd || String((await $.session.cwd()) ?? '')
+  const items = docItems(Array.isArray(list) ? list : [], cwd, await $.clock.now(), lang)
+  if (items.length === 0) return t(lang, 'noDocs')
+  const lines = items.map(d => {
+    const name = info ? markdownLink(d.name, reviewUrl(info, d.id, lang)) : d.name
+    const parts = [name, d.dir, d.when].filter(Boolean)
+    if (d.pending > 0) parts.push(t(lang, 'pendingOnPage', { n: d.pending }))
+    return `- ${parts.join(' · ')}`
+  })
+  return [t(lang, 'docsListHead', { n: items.length }), ...lines].join('\n')
+}
+
+/**
+ * 每秒：取本会话待发送的回复，变了就重画回复区。服务不在就当没有，不去启动它。
+ * @param {any} $
+ */
+async function refreshReplies($) {
+  if (isFetchingReplies) return
+  isFetchingReplies = true
+  const epoch = sessionEpoch
+  const local = repliesEpoch
+  try {
+    // 〔确认清空〕过了 3 秒没再点：按钮变回〔清空〕
+    if (clearArmedAt !== undefined && clearState(await $.clock.now(), clearArmedAt) === 'idle') {
+      clearArmedAt = undefined
+      redraw($)
+    }
+    const session = await $.session.id()
+    if (!sessionCwd) sessionCwd = String((await $.session.cwd()) ?? '')
+    const got = await call($, 'GET', `/api/replies?session=${encodeURIComponent(session)}`, undefined, false)
+    // 取的过程中换了会话，或本地刚删 / 清空 / 发出过：这份数据过时了
+    // 服务不在（got 为空）或应答不对：保留现有的回复，等它回来
+    if (epoch !== sessionEpoch || local !== repliesEpoch || !Array.isArray(got?.groups)) return
+    setReplies($, got.groups)
+  } catch {
+    // 一时取不到（服务忙、重启中）：保留现有的回复，不让回复区闪一下
+  } finally {
+    isFetchingReplies = false
+  }
+}
+
+/** @param {any} $ @param {import('../src/reply.js').ReplyGroup[]} groups */
+function setReplies($, groups) {
+  const key = JSON.stringify(groups)
+  if (key === repliesKey) return
+  replies = groups
+  repliesKey = key
+  // 少到不用列表时，展开状态作废
+  if (groups.reduce((n, g) => n + g.replies.length, 0) <= COLLAPSED_ROWS) isExpanded = false
+  redraw($)
+}
+
+/** 从本地列表里去掉这些回复，并让还在路上的取数结果作废。@param {any} $ @param {Set<string>} ids */
+function dropLocal($, ids) {
+  repliesEpoch++
+  setReplies(
+    $,
+    replies.map(g => ({ ...g, replies: g.replies.filter(r => !ids.has(r.id)) })).filter(g => g.replies.length > 0),
+  )
+}
+
+/**
+ * 回复已随消息交给 Claude：本地马上收起，再告诉服务端标为已发送（文档页的标记随之清掉）。
+ * 标记失败不影响已发出的消息，下一次取数时那几条会重新出现，可以删掉。
+ * @param {any} $ @param {import('../src/reply.js').ReplyGroup[]} sent
+ */
+async function markSent($, sent) {
+  const ids = sent.flatMap(g => g.replies.map(r => r.id))
+  if (ids.length === 0) return
+  dropLocal($, new Set(ids))
+  clearArmedAt = undefined
+  try {
+    await callLive($, 'POST', '/api/replies/sent', { ids })
+  } catch (err) {
+    // 消息已经发出，只是没标上：回复下一次取数会回到列表里，提示一下，免得再发一遍
+    $.ui.toast(t(lang, 'markSentFailed', { reason: messageOf(err) }))
+  } finally {
+    repliesEpoch++
+  }
+}
+
+/**
+ * 〔发送〕：按钮先变「发送中…」，以你的名义把回复块发进会话（插件自己发的消息不经过自己的 prompt.submit 钩子）；
+ * 发出后标为已发送并提示；失败时回复全部保留，提示原因。
+ * @param {any} $
+ */
+async function sendReplies($) {
+  if (isSending || replies.length === 0) return
+  isSending = true
+  redraw($)
+  const sending = replies
+  try {
+    const cwd = sessionCwd || String((await $.session.cwd()) ?? '')
+    const r = await $.prompt.submit({ text: withReplies('', sending, lang, cwd), asUser: true })
+    if (r?.drop !== undefined) {
+      $.ui.toast(t(lang, 'sendFailed', { reason: String(r.drop) }))
+      return
+    }
+    await markSent($, sending)
+    $.ui.toast(t(lang, 'sent'))
+  } catch (err) {
+    $.ui.toast(t(lang, 'sendFailed', { reason: messageOf(err) }))
+  } finally {
+    isSending = false
+    redraw($)
+  }
+}
+
+/** ×：删掉一条回复，文档页的标记随之消失。@param {any} $ @param {{ id: string, doc: string }} r */
+async function deleteReply($, r) {
+  try {
+    await callLive($, 'DELETE', `/api/comments?doc=${encodeURIComponent(r.doc)}&id=${encodeURIComponent(r.id)}`)
+    dropLocal($, new Set([r.id]))
+  } catch (err) {
+    $.ui.toast(t(lang, 'deleteFailed', { reason: messageOf(err) }))
+  }
+}
+
+/**
+ * 〔清空〕要点两次：第一次只把按钮变成「确认清空」，3 秒内再点才清空本会话所有待发送的回复。
+ * @param {any} $
+ */
+async function pressClear($) {
+  const now = await $.clock.now()
+  if (clearState(now, clearArmedAt) !== 'armed') {
+    clearArmedAt = now
+    redraw($)
+    return
+  }
+  clearArmedAt = undefined
+  try {
+    const session = await $.session.id()
+    await callLive($, 'DELETE', `/api/replies?session=${encodeURIComponent(session)}`)
+    dropLocal($, new Set(replies.flatMap(g => g.replies.map(r => r.id))))
+  } catch (err) {
+    $.ui.toast(t(lang, 'deleteFailed', { reason: messageOf(err) }))
+    redraw($)
+  }
+}
+
+/** @param {any} $ */
+function toggleList($) {
+  isExpanded = !isExpanded
+  redraw($)
 }
 
 /**
@@ -620,21 +697,21 @@ async function autoRegister($, file, config) {
   const cwd = await $.session.cwd()
   const path = file.startsWith('/') ? file : `${cwd}/${file}`
   if (!isReviewDoc(path, cwd, config)) return
-  // 命中即唤醒（登记完再唤醒，状态带第一次取数据就能带上这个文档）
+  // 命中即唤醒（登记完再唤醒）
   try {
     const now = await $.clock.now()
     // 检查和占位之间不能有 await：同一文件并发写两次时只登记一次
     if (now < autoRetryAt || autoRegistered.has(path)) return
     autoRegistered.add(path)
     try {
+      // 不弹「已登记」：Claude 回话里的链接和 /cc-doc-review 列表就是入口
       await openDoc($, path)
-      $.ui.toast(`已登记评审：${baseName(path)}`)
     } catch (err) {
       autoRegistered.delete(path)
       autoRetryAt = now + AUTO_BACKOFF_MS
       if (!hasAutoWarned) {
         hasAutoWarned = true
-        $.ui.toast(`自动登记评审失败：${messageOf(err)}`)
+        $.ui.toast(t(lang, 'autoFailed', { reason: messageOf(err) }))
       }
     }
   } finally {
@@ -643,25 +720,19 @@ async function autoRegister($, file, config) {
 }
 
 /**
- * 唤醒：会话开始时启动的定时器从下一次 tick 起投递（每秒）、刷新状态（每 2 秒），并在下一次投递 tick 顺带取一次状态。
+ * 唤醒：会话开始时启动的定时器从下一次 tick 起每秒取回复、插进输入框。
  * 只改标志，不建定时器。已唤醒时什么都不做。
  */
 function wake() {
   if (isAwake) return
   isAwake = true
-  isRefreshDue = true
 }
 
-/**
- * 复位为休眠：定时器空转，上一个会话的状态全部作废，状态带让位。
- * @param {any} $
- */
-function goDormant($) {
+/** 复位为休眠：定时器空转，上一个会话的状态全部作废。*/
+function goDormant() {
   isAwake = false
-  isRefreshDue = false
   sessionEpoch++
   resetSessionState()
-  $.ui.invalidate('ui.render')
 }
 
 /**
@@ -718,248 +789,35 @@ async function hasLocalDocs($, session) {
   return false
 }
 
-/** 换了会话（新开、/clear）时，上一个会话的状态带数据和提醒都作废。*/
+/** 换了会话（新开、/clear）时，上一个会话的回复都作废。*/
 function resetSessionState() {
-  docs = []
-  docsKey = ''
+  replies = []
+  repliesKey = '[]'
+  repliesEpoch++
   isExpanded = false
-  delivered.clear()
-  reminder = []
-  isReminderDismissed = false
-  reminderEpoch++
+  isSending = false
+  clearArmedAt = undefined
+  sessionCwd = ''
+  sentTexts.clear()
   autoRegistered.clear()
   hasAutoWarned = false
   autoRetryAt = 0
-  submittedBatches.clear()
-  retries.clear()
-  awaitingUser.clear()
-  attaching.clear()
-  remindedBatches.clear()
-  hasWarned = false
-  openedAt.clear()
-}
-
-/** @param {any} $ @param {import('../src/band.js').DocSummary[]} list */
-function setDocs($, list) {
-  const key = JSON.stringify(list)
-  if (key === docsKey) return
-  docs = list
-  docsKey = key
-  $.ui.invalidate('ui.render')
-}
-
-/** @param {any} $ @param {string[]} ids */
-function setReminder($, ids) {
-  if (ids.join() === reminder.join()) return
-  reminder = ids
-  $.ui.invalidate('ui.render')
-}
-
-/** @param {any} $ */
-function dismissReminder($) {
-  isReminderDismissed = true
-  $.ui.invalidate('ui.render')
-}
-
-/** @param {any} $ */
-function toggleList($) {
-  isExpanded = !isExpanded
-  $.ui.invalidate('ui.render')
 }
 
 /**
- * 查已送达评论的现状：取它们所在文档的详情，分出没回复的、已了结的（已解决或 404）和这次没查到的。
- * @param {any} $
- * @param {string[]} ids
- */
-async function lookupDelivered($, ids) {
-  /** @type {Map<string, string>} */
-  const docOf = new Map()
-  for (const id of ids) {
-    const doc = delivered.get(id)?.doc
-    if (doc) docOf.set(id, doc)
-  }
-  /** @type {Map<string, any>} */
-  const fetched = new Map()
-  for (const docId of new Set(docOf.values())) {
-    const d = await fetchDoc($, docId)
-    if (d !== undefined) fetched.set(docId, d)
-  }
-  return classifyDelivered(ids, docOf, fetched)
-}
-
-/**
- * 取文档详情：取到返回文档，404 返回 null，服务不可达或其他错误返回 undefined。不去启动服务。
- * @param {any} $ @param {string} docId
- */
-async function fetchDoc($, docId) {
-  try {
-    const info = await readInfo($)
-    if (!info || !(await isAlive($, info))) return undefined
-    const r = await request($, info, 'GET', `/api/doc?doc=${encodeURIComponent(docId)}`)
-    if (r.status === 404) return null
-    return parseReply(r)
-  } catch {
-    return undefined
-  }
-}
-
-/**
- * 一轮结束时：进入模型的评论里还有处于「处理中」的，状态带进入提醒状态，并自动提醒 Claude 一次
- * （每批评论最多一次，防止循环），同时弹提示告诉用户。服务一时不可达时保留原提醒，不清空。
- * @param {any} $
- */
-async function checkUnreplied($) {
-  const ids = [...delivered].filter(([, v]) => v.isInModel).map(([id]) => id)
-  if (ids.length === 0) return
-  const epoch = reminderEpoch
-  const { pending, settled, unknown } = await lookupDelivered($, ids)
-  for (const id of settled) delivered.delete(id)
-  // 核对期间有新一批评论进入模型（提醒被重置）或换了会话时，这次的结果作废
-  if (epoch !== reminderEpoch) return
-  setReminder($, nextReminder(pending, unknown, reminder))
-  const batchOf = new Map(pending.map(id => [id, delivered.get(id)?.batch ?? id]))
-  const target = reminderTargets(pending, batchOf, remindedBatches)
-  if (target.ids.length === 0) return
-  // 先记下再发：提醒那一轮结束时再核对，不会再提醒同一批
-  for (const b of target.batches) remindedBatches.add(b)
-  const n = target.ids.length
-  const isSent = await submitPrompt($, reminderPrompt(target.ids))
-  $.ui.toast(isSent ? remindedToast(n) : remindFailedToast(n))
-}
-
-/**
- * 取文档当前有效的评审链接：用服务的端口、口令和文档 ID 直接拼（服务不在会拉起）。
- * 不走 /api/open：那是「登记」，会刷新登记时间，把待确认、已通过的文档误判回待评审。
- * @param {any} $ @param {{ id: string }} doc
- */
-async function linkOf($, doc) {
-  return reviewUrl(await ensureServer($), doc.id)
-}
-
-/** @param {any} $ @param {{ path: string }} doc */
-async function openReview($, doc) {
-  let url
-  try {
-    url = await linkOf($, doc)
-  } catch (err) {
-    $.ui.toast(`打开评审页失败：${messageOf(err)}`)
-    return
-  }
-  // 先直接打开（浏览器面板或系统浏览器），不用等 Claude 回复，也不在对话里留消息
-  if (await openUrl($, url)) return
-  // 都打不开：退回请 Claude 在浏览器面板打开
-  const now = await $.clock.now()
-  // 检查和记下之间不能有 await：连点时只有第一下发请求
-  const last = openedAt.get(doc.path)
-  if (last !== undefined && now - last < OPEN_AGAIN_MS) {
-    $.ui.toast('已经请求过打开这个评审页，Claude 手上这轮结束后就会打开')
-    return
-  }
-  openedAt.set(doc.path, now)
-  $.ui.toast('已请求 Claude 在浏览器面板打开评审页')
-  try {
-    if (!(await submitPrompt($, `请在浏览器面板打开文档评审页：${url}`, true))) {
-      openedAt.delete(doc.path)
-      $.ui.toast(`打开评审页的请求没能发进会话，链接：${url}`)
-    }
-  } catch (err) {
-    openedAt.delete(doc.path)
-    $.ui.toast(`打开评审页失败：${messageOf(err)}`)
-  }
-}
-
-/** 桌面版浏览器面板的工具：插件可以像 Claude 一样直接调用，打开网页、查看面板状态。*/
-const BROWSER_TOOL = 'mcp__Claude_Browser__preview_start'
-const BROWSER_STATE_TOOL = 'mcp__Claude_Browser__tabs_context'
-
-/** 工具结果里的文字，用来判断和提示。@param {any} r */
-const toolText = r => String(r?.text ?? (typeof r?.result === 'string' ? r.result : JSON.stringify(r?.result ?? '')))
-
-/**
- * 浏览器面板现在是否打开并显示着：问一次面板状态；问不了时当作已显示（不再多做一步）。
- * @param {any} $ @param {boolean} canAsk
- */
-async function isPanelShown($, canAsk) {
-  if (!canAsk) return true
-  try {
-    // 结果里的引号可能被转义（\"browserOpen\": true），按词匹配；认不出来时当作已显示，不误判
-    const text = toolText(await $.tool.call({ tool: BROWSER_STATE_TOOL }))
-    if (/browserOpen\W*false/.test(text) || /currently hidden|is hidden/i.test(text)) return false
-    return true
-  } catch {
-    return true
-  }
-}
-
-/**
- * 直接打开评审页，不经过 Claude，点了马上能看到：
- * 1. 有浏览器面板（桌面版）时先在面板里打开（'panel'），并确认面板确实显示了；
- * 2. 面板打不开（比如自动模式下插件发起的调用被拦下）或面板收着看不见，就立刻用系统浏览器打开（'browser'），
- *    并提示原因；命令行版没有面板，直接用系统浏览器；
- * 3. 系统浏览器也打不开时返回 undefined，由调用方退回请 Claude 打开。
+ * 用系统浏览器打开链接（macOS 的 open，其余试 xdg-open）；都打不开时返回 false。
  * @param {any} $ @param {string} url
- * @returns {Promise<'panel' | 'browser' | undefined>}
  */
-async function openUrl($, url) {
-  let names = []
-  try {
-    names = (await $.tool.list()).map((/** @type {any} */ t) => t.name)
-  } catch {
-    // 取不到工具列表：当作没有面板
-  }
-  let reason = ''
-  if (names.includes(BROWSER_TOOL)) {
-    try {
-      const r = await $.tool.call({ tool: BROWSER_TOOL, url })
-      if (r?.deny !== undefined) reason = '内置浏览器被权限拦下'
-      else if (r?.isError) reason = `内置浏览器打不开：${toolText(r).slice(0, 80)}`
-      else if (await isPanelShown($, names.includes(BROWSER_STATE_TOOL))) return 'panel'
-      else reason = '内置浏览器面板是收起的'
-    } catch (err) {
-      reason = `内置浏览器打不开：${messageOf(err)}`
-    }
-  }
+async function openInBrowser($, url) {
   for (const argv of [['open', url], ['xdg-open', url]]) {
     try {
       const r = await $.process.run(argv, { timeoutMs: 5000 })
-      if (r.exitCode === 0) {
-        $.ui.toast(reason ? `${reason}，已在系统浏览器打开评审页` : '已在系统浏览器打开评审页')
-        return 'browser'
-      }
+      if (r.exitCode === 0) return true
     } catch {
       // 这个命令不存在：试下一个
     }
   }
-  if (reason) $.ui.toast(`${reason}，系统浏览器也打不开，已请 Claude 打开`)
-  return undefined
-}
-
-/**
- * 复制评审链接；界面不支持剪贴板（桌面版是远程界面）时改为把链接填进输入框。
- * @param {any} $ @param {{ path: string }} doc @param {string | undefined} surface
- */
-async function copyLink($, doc, surface) {
-  let url
-  try {
-    url = await linkOf($, doc)
-  } catch (err) {
-    $.ui.toast(`取评审链接失败：${messageOf(err)}`)
-    return
-  }
-  /** @type {{ isCopied: boolean, reason?: string }} */
-  let copied
-  try {
-    copied = await $.ui.copy({ text: url, surface })
-  } catch (err) {
-    copied = { isCopied: false, reason: messageOf(err) }
-  }
-  if (copied.isCopied) {
-    $.ui.toast('评审链接已复制')
-    return
-  }
-  await $.prompt.fill({ text: url, mode: 'append' })
-  $.ui.toast(`复制失败（${copyFailReason(String(copied.reason))}），链接已填进输入框`)
+  return false
 }
 
 /**
@@ -974,129 +832,6 @@ async function openDoc($, file) {
 /** 相对路径按会话的工作目录补成绝对路径。@param {any} $ @param {string} file */
 async function absPath($, file) {
   return file.startsWith('/') ? file : `${await $.session.cwd()}/${file}`
-}
-
-/**
- * review_status：本会话各文档的路径、链接、各状态条数和待处理评论。服务不在会拉起（数据在磁盘上）。
- * 某个文档取不到详情时用概况里的条数，不列评论。
- * @param {any} $
- */
-async function reviewStatus($) {
-  const session = await $.session.id()
-  const list = await call($, 'GET', `/api/docs?session=${encodeURIComponent(session)}`)
-  const info = await readInfo($)
-  const cwd = await $.session.cwd()
-  /** @type {import('../src/status.js').StatusEntry[]} */
-  const entries = []
-  for (const d of Array.isArray(list) ? list : []) {
-    const url = info ? reviewUrl(info, d.id) : ''
-    const detail = await fetchDoc($, d.id)
-    const comments = Array.isArray(detail?.comments) ? detail.comments : undefined
-    if (!comments) {
-      entries.push({ path: d.path, url, drafts: d.drafts ?? 0, sent: d.sent ?? 0, pending: [] })
-      continue
-    }
-    const pending = comments
-      .filter((/** @type {any} */ c) => c.status === 'sent')
-      .map((/** @type {any} */ c) => ({ id: String(c.id), quote: String(c.quote ?? ''), body: String(c.body ?? '') }))
-    entries.push({ path: d.path, url, ...countsOf(comments), pending })
-  }
-  return statusResult(entries, cwd)
-}
-
-/**
- * 每秒一次：把本会话 outbox 里的批次发进会话。服务不在就跳过，不去启动它。
- * 发不进去（被拒或出错）时按 5、15、45 秒重试；仍不行就等用户的下一条消息，附在上面送达（见 prompt.submit 钩子）。
- * @param {any} $
- */
-async function deliver($) {
-  if (isDelivering) return
-  isDelivering = true
-  const epoch = sessionEpoch
-  try {
-    const session = await $.session.id()
-    const batches = await call($, 'GET', `/api/outbox?session=${encodeURIComponent(session)}`, undefined, false)
-    if (!batches) return
-    const cwd = await $.session.cwd()
-    for (const batch of batches) {
-      // 取的过程中会话结束了：别把上一个会话的评论发进新会话
-      if (epoch !== sessionEpoch) return
-      const id = batch.batch
-      // 等着附在、或正附在用户消息上的：不另发
-      if (awaitingUser.has(id) || attaching.has(id)) continue
-      if (!submittedBatches.has(id)) {
-        const retry = retries.get(id)
-        if (retry && (await $.clock.now()) < retry.nextAt) continue
-        // 先记下再发：prompt.submit 在那一轮开始时才返回，turn.start 要能认出这批评论
-        recordBatch(batch)
-        const text = formatBatch(batch, cwd)
-        const isSent = await submitPrompt($, text, true)
-        if (epoch !== sessionEpoch) return
-        if (!isSent) {
-          await scheduleRetry($, batch, text)
-          continue
-        }
-        retries.delete(id)
-        submittedBatches.add(id)
-        $.ui.toast(batch.kind === 'approve' ? approvedToast(baseName(batch.path)) : deliveredToast(batch.comments.length))
-      }
-      await call($, 'POST', '/api/outbox/ack', { session, batch: id })
-      submittedBatches.delete(id)
-    }
-    hasWarned = false
-  } catch (err) {
-    if (!hasWarned) {
-      hasWarned = true
-      $.ui.toast(`文档评审：${messageOf(err)}`)
-    }
-  } finally {
-    isDelivering = false
-  }
-}
-
-/**
- * 一批没发进会话：记下失败次数和下次重试的时间；重试用完就改为等用户的下一条消息，并提示用户。
- * @param {any} $ @param {{ batch: string, kind?: string, path: string, comments: { id: string }[] }} batch @param {string} text 排好的消息
- */
-async function scheduleRetry($, batch, text) {
-  const failures = (retries.get(batch.batch)?.failures ?? 0) + 1
-  const delay = retryDelay(failures)
-  if (delay !== undefined) {
-    retries.set(batch.batch, { failures, nextAt: (await $.clock.now()) + delay })
-    return
-  }
-  retries.delete(batch.batch)
-  awaitingUser.set(batch.batch, { batch: batch.batch, text, ids: batch.comments.map(c => c.id) })
-  $.ui.toast(batch.kind === 'approve' ? approveQueuedToast(baseName(batch.path)) : queuedToast(batch.comments.length))
-}
-
-/**
- * 记下一批评论。是否进入模型由 turn.start（发进会话的那批）或 prompt.submit 钩子（附在用户消息上的那批）认定。
- * @param {{ batch: string, doc: string, comments: { id: string }[] }} batch
- */
-function recordBatch(batch) {
-  for (const c of batch.comments) {
-    if (!delivered.has(c.id)) delivered.set(c.id, { doc: batch.doc, batch: batch.batch, isInModel: false })
-  }
-}
-
-/**
- * 「[文档评审]」消息开始了一轮：其中的评论进入模型。新一批进来时，之前的提醒和〔×〕都作废，到这一轮结束再判断。
- * @param {any} $ @param {string[]} ids
- */
-function markInModel($, ids) {
-  let isNew = false
-  for (const id of ids) {
-    const entry = delivered.get(id)
-    if (entry && !entry.isInModel) {
-      entry.isInModel = true
-      isNew = true
-    }
-  }
-  if (!isNew) return
-  reminderEpoch++
-  isReminderDismissed = false
-  setReminder($, [])
 }
 
 /** @param {any} $ */
@@ -1119,7 +854,7 @@ async function readInfo($) {
 }
 
 /**
- * 服务的 health 应答：在跑且是评审服务就返回应答，否则 undefined。
+ * 服务的 health 应答：在跑且是文档服务就返回应答，否则 undefined。
  * @param {any} $ @param {{ port: number }} info
  */
 async function healthOf($, info) {
@@ -1161,7 +896,7 @@ async function ensureServer($) {
       restartRetryAt = (await $.clock.now()) + RESTART_BACKOFF_MS
       if (staleWarnedFor !== version) {
         staleWarnedFor = version
-        $.ui.toast(`文档评审：评审服务要更新到 ${version}，但${why}，继续使用旧版`)
+        $.ui.toast(`cc-doc-review：文档服务要更新到 ${version}，但${why}，继续使用旧版`)
       }
       return running
     }
@@ -1203,7 +938,7 @@ async function startAndWait($, bin, isDev) {
   }
   // 下载或编译来的程序起不来：删掉它，下次重新获取（开发模式的程序是开发者自己编的，不动）
   if (!isDev) await run($, removeArgv(bin))
-  throw new Error(`评审服务启动失败，日志：${log}`)
+  throw new Error(`文档服务启动失败，日志：${log}`)
 }
 
 /** 插件版本：读 plugin.json（$.plugin 里没有版本号）。读不到就报错。@param {any} $ */
@@ -1272,7 +1007,7 @@ async function fetchBinary($, version, dest, isUpdate) {
   if (uname.exitCode !== 0) reason = `无法判断系统和芯片（uname 失败：${failureOf(uname)}）`
   else if (!platform) reason = '不支持的平台，没有对应的预编译程序'
   else {
-    $.ui.toast(isUpdate ? '文档评审：插件已更新，正在准备新版评审服务' : '文档评审：首次使用，正在下载评审服务')
+    $.ui.toast(isUpdate ? 'cc-doc-review：插件已更新，正在准备新版文档服务' : 'cc-doc-review：首次使用，正在下载文档服务')
     try {
       await downloadBinary($, version, platform, dest, unique)
       return
@@ -1282,14 +1017,14 @@ async function fetchBinary($, version, dest, isUpdate) {
   }
   const shell = await findGoShell($)
   if (!shell) {
-    throw new Error(`评审服务获取失败（${label}）：${reason}。本机登录 shell 里也没有 Go，无法本地编译；请检查网络后重试，或安装 Go`)
+    throw new Error(`文档服务获取失败（${label}）：${reason}。本机登录 shell 里也没有 Go，无法本地编译；请检查网络后重试，或安装 Go`)
   }
-  $.ui.toast(`文档评审：${reason}，改为本地编译，可能要一分钟`)
+  $.ui.toast(`cc-doc-review：${reason}，改为本地编译，可能要一分钟`)
   const tmp = `${dest}.build-${unique}`
   const built = await run($, goBuildArgv(shell, $.plugin.root, version, tmp, dest), 300_000)
   if (built.exitCode !== 0) {
     await run($, removeArgv(tmp))
-    throw new Error(`评审服务获取失败（${label}）：${reason}；本地编译失败：${failureOf(built)}`)
+    throw new Error(`文档服务获取失败（${label}）：${reason}；本地编译失败：${failureOf(built)}`)
   }
 }
 
@@ -1330,7 +1065,7 @@ async function findGoShell($) {
 }
 
 /**
- * 结束运行中的服务：进程号来自 server.json，命令行确认是评审服务才结束，并等端口释放。
+ * 结束运行中的服务：进程号来自 server.json，命令行确认是文档服务才结束，并等端口释放。
  * @param {any} $ @param {{ port: number, pid?: number }} info
  * @returns {Promise<boolean>} 是否已结束
  */
@@ -1366,9 +1101,9 @@ async function migrateLegacy($) {
     if (!shouldCopyLegacy({ hasLegacyDir: true, hasNewDocs })) return
     const r = await $.process.run(copyLegacyArgv(oldDir, newDir))
     if (r.exitCode !== 0) throw new Error(r.stderr.trim() || `退出码 ${r.exitCode}`)
-    $.ui.toast('文档评审：已把旧版评论数据迁移到 ~/.claude/cc-doc-review')
+    $.ui.toast('cc-doc-review：已把旧版数据迁移到 ~/.claude/cc-doc-review')
   } catch (err) {
-    $.ui.toast(`文档评审：迁移旧数据失败（${messageOf(err)}），旧数据仍在 ~/.claude/doc-review`)
+    $.ui.toast(`cc-doc-review：迁移旧数据失败（${messageOf(err)}），旧数据仍在 ~/.claude/doc-review`)
   }
 }
 
@@ -1416,7 +1151,17 @@ async function call($, method, path, body, shouldStart = true) {
 }
 
 /**
- * 向评审服务发一个请求，返回原始应答。
+ * 向已在运行的文档服务发请求（不去拉起服务）；服务不在时抛错，免得删除、标记假装成功。
+ * @param {any} $ @param {string} method @param {string} path @param {unknown} [body]
+ */
+async function callLive($, method, path, body) {
+  const info = await readInfo($)
+  if (!info || !(await isAlive($, info))) throw new Error(t(lang, 'serverGone'))
+  return parseReply(await request($, info, method, path, body))
+}
+
+/**
+ * 向文档服务发一个请求，返回原始应答。
  * @param {any} $ @param {{ port: number, token: string }} info
  * @param {string} method @param {string} path @param {unknown} [body]
  */

@@ -52,7 +52,7 @@ export function killArgv(pid) {
 }
 
 /**
- * 进程命令行是不是旧版评审服务（程序名 doc-review-server）。
+ * 进程命令行是不是旧版文档服务（程序名 doc-review-server）。
  * 新版叫 cc-doc-review-server，不能误杀。
  * @param {string} command
  */

@@ -2,10 +2,10 @@
 
 /** 默认的包含模式（逗号分隔），与 plugin.json userConfig.includePatterns 的默认值保持一致。*/
 export const DEFAULT_INCLUDE =
-  '**/specs/**/*.{md,html},**/plans/**/*.{md,html},**/docs/**/*.{md,markdown,html,htm}'
+  '**/*.{md,markdown,html,htm}'
 /** 默认的排除模式（逗号分隔），与 plugin.json userConfig.excludePatterns 的默认值保持一致。*/
 export const DEFAULT_EXCLUDE =
-  '**/.superpowers/**,**/node_modules/**,**/vendor/**,**/dist/**,**/.git/**,**/.claude/**,**/README*,**/CHANGELOG*,**/CLAUDE.md'
+  '**/.superpowers/**,**/node_modules/**,**/vendor/**,**/dist/**,**/.git/**,**/.claude/**,**/README*,**/CHANGELOG*,**/CLAUDE.md,**/AGENTS.md,**/LICENSE*,**/CONTRIBUTING*,**/SECURITY*,**/CODE_OF_CONDUCT*,**/.github/**,**/build/**,**/coverage/**'
 
 /** @typedef {{ enabled: boolean, include: string[], exclude: string[] }} AutoConfig */
 
